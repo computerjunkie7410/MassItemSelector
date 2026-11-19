@@ -20,12 +20,13 @@ bool FindHintFields(FArrayProperty* Array, FTextProperty*& Action, FTextProperty
     return Action && Key;
 }
 
-bool UpdateHintArray(FScriptArrayHelper& Hints, FTextProperty* Action, FTextProperty* Key, bool bRemove)
+bool UpdateHintArray(FScriptArrayHelper& Hints, FTextProperty* Action, FTextProperty* Key, bool bRemove,
+    const FText& ActionText, const TCHAR* KeyText)
 {
     for (int32 I = Hints.Num() - 1; I >= 0; --I)
     {
-        const bool bOurs = Action->GetPropertyValue_InContainer(Hints.GetRawPtr(I)).ToString() == TEXT("Mass Selection") &&
-            Key->GetPropertyValue_InContainer(Hints.GetRawPtr(I)).ToString() == TEXT("M");
+        const bool bOurs = Action->GetPropertyValue_InContainer(Hints.GetRawPtr(I)).EqualTo(ActionText) &&
+            Key->GetPropertyValue_InContainer(Hints.GetRawPtr(I)).ToString() == KeyText;
         if (!bOurs) continue;
         if (!bRemove) return false;
         Hints.RemoveValues(I);
@@ -33,8 +34,8 @@ bool UpdateHintArray(FScriptArrayHelper& Hints, FTextProperty* Action, FTextProp
     }
     if (bRemove) return false;
     uint8* Entry = Hints.GetRawPtr(Hints.AddValue());
-    Action->SetPropertyValue_InContainer(Entry, LOCTEXT("MassSelection", "Mass Selection"));
-    Key->SetPropertyValue_InContainer(Entry, FText::FromString(TEXT("M")));
+    Action->SetPropertyValue_InContainer(Entry, ActionText);
+    Key->SetPropertyValue_InContainer(Entry, FText::FromString(KeyText));
     return true;
 }
 
@@ -58,7 +59,9 @@ bool UMISHUDHooks::UpdateMassSelectionHint(UObject* Target, bool bRemove)
     FArrayProperty* Input = FindSetterArray(Setter, Cache);
     if (!Input || !FindHintFields(Cache, Action, Key)) return false;
     FScriptArrayHelper Hints(Cache, Cache->ContainerPtrToValuePtr<void>(Refunds));
-    if (!UpdateHintArray(Hints, Action, Key, bRemove)) return false;
+    const bool bMassChanged = UpdateHintArray(Hints, Action, Key, bRemove, LOCTEXT("MassSelection", "Mass Selection"), TEXT("M"));
+    const bool bPanelChanged = UpdateHintArray(Hints, Action, Key, bRemove, LOCTEXT("SelectionTypes", "Advanced Dismantle Filter"), TEXT("N"));
+    if (!bMassChanged && !bPanelChanged) return false;
     FStructOnScope Params(Setter);
     Input->CopyCompleteValue(Input->ContainerPtrToValuePtr<void>(Params.GetStructMemory()), Cache->ContainerPtrToValuePtr<void>(Refunds));
     Refunds->ProcessEvent(Setter, Params.GetStructMemory());

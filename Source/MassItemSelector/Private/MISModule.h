@@ -4,6 +4,8 @@
 #include "Modules/ModuleManager.h"
 #include "MISSelectionGeometry.h"
 #include "MISPresentationCache.h"
+#include "MISSelectionPanel.h"
+#include "MISBuildableEligibility.h"
 #include "Components/SlateWrapperTypes.h"
 #include "UObject/StrongObjectPtr.h"
 #include "InputAction.h"
@@ -17,6 +19,7 @@ class SMISOverlay;
 class UUserWidget;
 class UEnhancedInputComponent;
 class UEnhancedInputLocalPlayerSubsystem;
+class UMISSelectionObserver;
 
 class FMISModule : public IModuleInterface
 {
@@ -39,6 +42,12 @@ public:
     bool IsApplying() const { return bScanning && bApplying; }
     bool IsScanning() const { return bScanning; }
     FText GetActivityStatus() const;
+    const TArray<TSharedPtr<FMISSelectionType>>& GetSelectionTypes() const { return SelectionTypes; }
+    void SetSelectionTypeEnabled(UClass* Class, bool bEnabled);
+    void CloseSelectionInteraction();
+    bool IsSelectionInteractive() const { return bSelectionInteractive; }
+    bool IsSelectionBusy() const { return !SelectionOperations.IsEmpty() || IsApplying(); }
+    FText GetSelectionStatus() const;
 
 private:
     struct FCandidate
@@ -71,12 +80,51 @@ private:
     void RemoveMassSelectionInput();
     void UpdateMassSelectionHints();
     void RemoveMassSelectionHints();
+    void TickSelectionPanel();
+    void MarkSelectionChanged();
+    void CheckSelectionChanges();
+    void RefreshSelectionPanel();
+    void ResetSelectionPanel();
+    void ReleaseSelectionPanel();
+    void ToggleSelectionInteraction();
+    void ProcessSelectionOperations();
+    FMISSelectionObject CaptureSelectionObject(AActor* Actor) const;
+    bool IsSelectionObjectValid(const FMISSelectionObject& Object) const;
+    void UnbindSelectionObserver();
+    int32 GetPanelSelectedCount() const;
 
     TWeakObjectPtr<UFGBuildGunStateDismantle> ActiveState;
     TWeakObjectPtr<APlayerController> Player;
     TWeakObjectPtr<UGameViewportClient> OpenViewport;
     TWeakObjectPtr<UWorld> ActiveWorld;
     TSharedPtr<SMISOverlay> Overlay;
+    TSharedPtr<SMISSelectionPanel> SelectionPanel;
+    TWeakObjectPtr<UGameViewportClient> SelectionViewport;
+    TStrongObjectPtr<UMISSelectionObserver> SelectionObserver;
+    TArray<TSharedPtr<FMISSelectionType>> SelectionTypes;
+    TArray<TSharedPtr<FMISSelectionType>> UpdatedSelectionTypes;
+    TMap<TWeakObjectPtr<UClass>, TSharedPtr<FMISSelectionType>> SelectionTypeLookup;
+    TArray<FMISSelectionSnapshotEntry> NativeSelectionSnapshot;
+    TArray<FMISSelectionSnapshotEntry> UpdatedSelectionSnapshot;
+    MIS::FBuildableEligibilityCache BuildableEligibility;
+    TMap<FMISSelectionKey, FMISSelectionObject> ExcludedSelection;
+    TArray<FMISSelectionObject> SelectionOperations;
+    int32 NextSelectionOperation = 0;
+    int32 SelectionOperationChanged = 0;
+    bool bRestoreSelection = false;
+    bool bInsideSelectionMutation = false;
+    bool bSelectionDirty = true;
+    bool bSelectionSnapshotDirty = true;
+    bool bSelectedActorLookupDirty = true;
+    bool bTemporaryPinsDirty = true;
+    bool bSelectionInteractive = false;
+    bool bSelectionPreviousCursor = false;
+    bool bSelectionRequested = false;
+    double NextSelectionCheck = 0;
+    uint16 SelectionTextRevision = 0;
+    FText SelectionMessage;
+    TStrongObjectPtr<UInputAction> SelectionPanelAction;
+    uint32 SelectionPanelBinding = 0;
     TStrongObjectPtr<UInputAction> MassSelectionAction;
     TStrongObjectPtr<UInputMappingContext> MassSelectionContext;
     TWeakObjectPtr<UEnhancedInputComponent> MassSelectionInput;
@@ -85,6 +133,8 @@ private:
     bool bMassSelectionRequested = false;
     TArray<TWeakObjectPtr<UUserWidget>> MassSelectionHintTargets;
     double NextHintScan = 0;
+    double NextHintUpdate = 0;
+    TWeakObjectPtr<UUserWidget> HintHUDRoot;
     TWeakObjectPtr<UUserWidget> HiddenHUDWidget;
     ESlateVisibility PreviousHUDVisibility = ESlateVisibility::SelfHitTestInvisible;
     bool bDistanceWasEdited = false;
