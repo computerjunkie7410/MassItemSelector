@@ -65,6 +65,17 @@ void UMISModConfiguration::PostInitProperties()
     Side->MaxValue = 1;
     Side->DefaultValue = Side->Value = static_cast<int32>(EMISDistancePanelSide::Left);
     Section->SectionProperties.Add(TEXT("DistancePanelSide"), Side);
+
+    auto* SelectionSide = NewObject<UCP_Integer>(Section, IntegerClass, TEXT("SelectionPanelSide"));
+    SelectionSide->bRequiresWorldReload = false;
+    SelectionSide->DisplayName = LOCTEXT("SelectionPanelSideLabel", "Selection panel side");
+    SelectionSide->Tooltip = LOCTEXT("SelectionPanelSideTooltip", "Place the selected building types on the left or right. Updates immediately.");
+    SelectionSide->WidgetType = ECP_IntegerWidgetType::CPI_Enum;
+    SelectionSide->EnumClass = StaticEnum<EMISDistancePanelSide>();
+    SelectionSide->MinValue = 0;
+    SelectionSide->MaxValue = 1;
+    SelectionSide->DefaultValue = SelectionSide->Value = static_cast<int32>(EMISDistancePanelSide::Left);
+    Section->SectionProperties.Add(TEXT("SelectionPanelSide"), SelectionSide);
 }
 
 UMISGameInstanceModule::UMISGameInstanceModule()
@@ -84,6 +95,14 @@ EMISDistancePanelSide UMISConfigurationLibrary::GetPanelSide(UObject* WorldConte
 {
     auto* Root = GetPreferences(WorldContext);
     auto* Property = Root ? Cast<UConfigPropertyInteger>(Root->SectionProperties.FindRef(TEXT("DistancePanelSide"))) : nullptr;
+    return Property && Property->Value == static_cast<int32>(EMISDistancePanelSide::Right)
+        ? EMISDistancePanelSide::Right : EMISDistancePanelSide::Left;
+}
+
+EMISDistancePanelSide UMISConfigurationLibrary::GetSelectionPanelSide(UObject* WorldContext)
+{
+    auto* Root = GetPreferences(WorldContext);
+    auto* Property = Root ? Cast<UConfigPropertyInteger>(Root->SectionProperties.FindRef(TEXT("SelectionPanelSide"))) : nullptr;
     return Property && Property->Value == static_cast<int32>(EMISDistancePanelSide::Right)
         ? EMISDistancePanelSide::Right : EMISDistancePanelSide::Left;
 }

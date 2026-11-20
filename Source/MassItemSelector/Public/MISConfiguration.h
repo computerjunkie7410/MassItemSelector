@@ -37,4 +37,5 @@ class MASSITEMSELECTOR_API UMISConfigurationLibrary : public UBlueprintFunctionL
 public:
     static float GetWheelStep(UObject* WorldContext);
     static EMISDistancePanelSide GetPanelSide(UObject* WorldContext);
+    static EMISDistancePanelSide GetSelectionPanelSide(UObject* WorldContext);
 };

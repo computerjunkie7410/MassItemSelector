@@ -2,8 +2,11 @@
 #include "MISOverlay.h"
 #include "MISHUDHooks.h"
 #include "MISConfiguration.h"
+#include "MISSelectionObserver.h"
 #include "MISSelectionRange.h"
 #include "MISSelectionBudget.h"
+#include "MISBuildableEligibility.h"
+#include "FGRecipe.h"
 #include "Buildables/FGBuildable.h"
 #include "Buildables/FGBuildableWire.h"
 #include "Camera/PlayerCameraManager.h"
@@ -68,11 +71,14 @@ void FMISModule::StartupModule()
         if (ActiveState.IsValid()) EndState(ActiveState.Get());
         else
         {
+            UnbindSelectionObserver();
+            ResetSelectionPanel();
             CloseOverlay();
             RemoveMassSelectionInput();
             RemoveMassSelectionHints();
             RemoveFeedback();
             ReleaseTemporaryPins(true);
+            BuildableEligibility.Reset();
             Player.Reset();
             ActiveWorld.Reset();
         }
@@ -85,10 +91,12 @@ void FMISModule::StartupModule()
         CDO, [this](UFGBuildGunStateDismantle* State) { EndState(State); });
     AimHook = SUBSCRIBE_METHOD(UFGBuildGunStateDismantle::SetAimedAtActor,
         [this](auto& Scope, UFGBuildGunStateDismantle* State, AActor* Actor) {
-            if (Overlay.IsValid() && ActiveState.Get() == State && Actor) Scope.Cancel();
+            if ((Overlay.IsValid() || bSelectionInteractive) && ActiveState.Get() == State && Actor) Scope.Cancel();
         });
     ClearHook = SUBSCRIBE_METHOD_AFTER(UFGBuildGunStateDismantle::ClearPendingSelectedActors,
         [this](UFGBuildGunStateDismantle* State) {
+            if (ActiveState.Get() == State) MarkSelectionChanged();
+            if (ActiveState.Get() == State && !bInsideSelectionMutation) ResetSelectionPanel();
             if (ActiveState.Get() == State && IsApplying())
                 FinishApply(TEXT("Selection stopped: native dismantle selection was cleared."));
         });
@@ -103,6 +111,9 @@ void FMISModule::ShutdownModule()
     FWorldDelegates::OnWorldCleanup.Remove(WorldCleanupHook);
     if (ActiveState.IsValid()) EndState(ActiveState.Get());
     else CloseOverlay();
+    UnbindSelectionObserver();
+    ResetSelectionPanel();
+    BuildableEligibility.Reset();
     RemoveMassSelectionInput();
     RemoveMassSelectionHints();
     RemoveFeedback();
@@ -124,15 +135,21 @@ void FMISModule::TickState(UFGBuildGunStateDismantle* State)
     if (ActiveState.Get() != State)
     {
         if (ActiveState.IsValid()) EndState(ActiveState.Get());
+        BuildableEligibility.Reset();
         ActiveState = State;
         Player = PC;
         ActiveWorld = PC->GetWorld();
+        SelectionObserver.Reset(NewObject<UMISSelectionObserver>());
+        SelectionObserver->OnChanged = [this] { MarkSelectionChanged(); };
+        State->OnPendingDismantleActorsChanged.AddDynamic(SelectionObserver.Get(), &UMISSelectionObserver::SelectionChanged);
+        bSelectionDirty = true;
+        MarkSelectionChanged();
     }
     InstallMassSelectionInput();
     UpdateMassSelectionHints();
     const bool bOpenRequested = bMassSelectionRequested;
     bMassSelectionRequested = false;
-    ReleaseTemporaryPins(false);
+    TickSelectionPanel();
     if (IsApplying())
     {
         if (!PC->IsPaused()) ProcessBatch();
@@ -155,7 +172,7 @@ void FMISModule::TickState(UFGBuildGunStateDismantle* State)
         }
         if (bScanning) ProcessBatch();
     }
-    else if (!PC->bShowMouseCursor && !PC->IsPaused() &&
+    else if (!bSelectionInteractive && SelectionOperations.IsEmpty() && !PC->bShowMouseCursor && !PC->IsPaused() &&
         bOpenRequested && !PC->IsInputKeyDown(EKeys::LeftMouseButton))
     {
         OpenOverlay();
@@ -165,6 +182,8 @@ void FMISModule::TickState(UFGBuildGunStateDismantle* State)
 void FMISModule::EndState(UFGBuildGunStateDismantle* State)
 {
     if (ActiveState.Get() != State) return;
+    UnbindSelectionObserver();
+    ResetSelectionPanel();
     CloseOverlay();
     RemoveMassSelectionInput();
     RemoveMassSelectionHints();
@@ -174,6 +193,8 @@ void FMISModule::EndState(UFGBuildGunStateDismantle* State)
     Player.Reset();
     ActiveWorld.Reset();
     SelectedActorLookup.Empty();
+    bSelectedActorLookupDirty = true;
+    BuildableEligibility.Reset();
 }
 
 void FMISModule::InstallMassSelectionInput()
@@ -191,9 +212,15 @@ void FMISModule::InstallMassSelectionInput()
         MassSelectionAction->bConsumeInput = true;
         MassSelectionContext.Reset(NewObject<UInputMappingContext>());
         MassSelectionContext->MapKey(MassSelectionAction.Get(), EKeys::M);
+        SelectionPanelAction.Reset(NewObject<UInputAction>());
+        SelectionPanelAction->ActionDescription = LOCTEXT("SelectionPanelAction", "Advanced Dismantle Filter");
+        SelectionPanelAction->bConsumeInput = true;
+        MassSelectionContext->MapKey(SelectionPanelAction.Get(), EKeys::N);
     }
     MassSelectionBinding = Input->BindActionValueLambda(MassSelectionAction.Get(), ETriggerEvent::Started,
         [this](const FInputActionValue&) { bMassSelectionRequested = true; }).GetHandle();
+    SelectionPanelBinding = Input->BindActionValueLambda(SelectionPanelAction.Get(), ETriggerEvent::Started,
+        [this](const FInputActionValue&) { bSelectionRequested = true; }).GetHandle();
     MassSelectionInput = Input;
     MassSelectionSubsystem = Subsystem;
     Subsystem->AddMappingContext(MassSelectionContext.Get(), 10000);
@@ -201,13 +228,18 @@ void FMISModule::InstallMassSelectionInput()
 
 void FMISModule::RemoveMassSelectionInput()
 {
-    if (auto* Input = MassSelectionInput.Get()) Input->RemoveBindingByHandle(MassSelectionBinding);
+    if (auto* Input = MassSelectionInput.Get())
+    {
+        Input->RemoveBindingByHandle(MassSelectionBinding);
+        Input->RemoveBindingByHandle(SelectionPanelBinding);
+    }
     if (auto* Subsystem = MassSelectionSubsystem.Get())
         if (MassSelectionContext.IsValid()) Subsystem->RemoveMappingContext(MassSelectionContext.Get());
     MassSelectionInput.Reset();
     MassSelectionSubsystem.Reset();
     MassSelectionBinding = 0;
     bMassSelectionRequested = false;
+    bSelectionRequested = false;
 }
 
 void FMISModule::RemoveMassSelectionHints()
@@ -218,27 +250,48 @@ void FMISModule::RemoveMassSelectionHints()
                 UMISHUDHooks::UpdateMassSelectionHint(Target, true);
     MassSelectionHintTargets.Reset();
     NextHintScan = 0;
+    NextHintUpdate = 0;
+    HintHUDRoot.Reset();
 }
 
 void FMISModule::UpdateMassSelectionHints()
 {
     auto* PC = Player.Get();
     const double Now = FPlatformTime::Seconds();
-    if (!PC || Now < NextHintScan) return;
-    NextHintScan = Now + 0.25;
+    if (!PC || Now < NextHintUpdate) return;
+    auto* HUD = Cast<AFGHUD>(PC->GetHUD());
+    UUserWidget* Root = HUD ? HUD->GetBaseUI() : nullptr;
+    if (Root != HintHUDRoot.Get())
+    {
+        RemoveMassSelectionHints();
+        HintHUDRoot = Root;
+    }
+    NextHintUpdate = Now + 0.25;
+    MassSelectionHintTargets.RemoveAll([PC](const auto& Target) {
+        return !Target.IsValid() || Target->GetWorld() != PC->GetWorld() ||
+            (Target->GetOwningPlayer() && Target->GetOwningPlayer() != PC);
+    });
+    for (const auto& Target : MassSelectionHintTargets)
+        UMISHUDHooks::UpdateMassSelectionHint(Target.Get(), false);
+    if (!MassSelectionHintTargets.IsEmpty() && Now < NextHintScan) return;
+    NextHintScan = Now + 2.0;
     for (TObjectIterator<UUserWidget> It; It; ++It)
     {
         auto* Target = *It;
         if (Target->IsTemplate() || Target->GetClass()->GetFName() != TEXT("Widget_DismantleMode_C") ||
             Target->GetWorld() != PC->GetWorld() || (Target->GetOwningPlayer() && Target->GetOwningPlayer() != PC)) continue;
-        MassSelectionHintTargets.AddUnique(Target);
-        UMISHUDHooks::UpdateMassSelectionHint(Target, false);
+        if (!MassSelectionHintTargets.Contains(Target))
+        {
+            MassSelectionHintTargets.Add(Target);
+            UMISHUDHooks::UpdateMassSelectionHint(Target, false);
+        }
     }
     MassSelectionHintTargets.RemoveAll([](const auto& Target) { return !Target.IsValid(); });
 }
 
 void FMISModule::OpenOverlay()
 {
+    CloseSelectionInteraction();
     APlayerController* PC = Player.Get();
     UFGBuildGunStateDismantle* State = ActiveState.Get();
     UGameViewportClient* Viewport = PC && PC->GetWorld() ? PC->GetWorld()->GetGameViewport() : nullptr;
@@ -265,6 +318,7 @@ void FMISModule::OpenOverlay()
     PC->SetIgnoreLookInput(true);
     PC->SetIgnoreMoveInput(true);
     Overlay = SNew(SMISOverlay).Owner(this);
+    if (SelectionPanel.IsValid()) SelectionPanel->SetVisibility(EVisibility::Collapsed);
     OpenViewport = Viewport;
     Viewport->AddViewportWidgetContent(Overlay.ToSharedRef(), 100);
     PC->bShowMouseCursor = true;
@@ -382,7 +436,7 @@ void FMISModule::StartSelection(const TArray<FVector2D>& Points, FVector2D Local
             if (IsValid(Actor) && !Actor->GetIsLightweightTemporary())
             {
                 const FVector Center = CenterOf(Actor);
-                if (!IsCenterInRange(Center)) continue;
+                if (!IsCenterInRange(Center) || !BuildableEligibility.IsActorSelectable(Actor)) continue;
                 FCandidate& Candidate = Candidates.AddDefaulted_GetRef();
                 Candidate.Actor = Actor;
                 Candidate.Center = Center;
@@ -395,7 +449,8 @@ void FMISModule::StartSelection(const TArray<FVector2D>& Points, FVector2D Local
                 if (!Data.IsValid()) continue;
                 const FVector Center = Data.BoundingBox.IsValid
                     ? Data.Transform.TransformPosition(Data.BoundingBox.GetCenter()) : Data.Transform.GetLocation();
-                if (!IsCenterInRange(Center)) continue;
+                if (!IsCenterInRange(Center) || !BuildableEligibility.IsTypeSelectable(Pair.Key.Get(),
+                    UFGRecipe::GetDescriptorForRecipe(Data.BuiltWithRecipe))) continue;
                 FCandidate& Candidate = Candidates.AddDefaulted_GetRef();
                 Candidate.LightweightClass = Pair.Key.Get();
                 Candidate.LightweightIndex = Index;
@@ -462,6 +517,7 @@ bool FMISModule::IsCenterInsideLasso(APlayerController* PC, const FVector& Cente
 void FMISModule::RefreshSelectedActorLookup(const UFGBuildGunStateDismantle* State)
 {
     SelectedActorLookup.Reset();
+    bSelectedActorLookupDirty = false;
     if (!State) return;
     SelectedActorLookup.Reserve(State->mPendingDismantleActors.Num());
     for (AActor* Actor : State->mPendingDismantleActors) SelectedActorLookup.Add(Actor);
@@ -485,7 +541,6 @@ void FMISModule::ProcessBatch()
     const double Deadline = FPlatformTime::Seconds() +
         FMath::Clamp(BatchMilliseconds.GetValueOnGameThread(), 0.25f, 16.f) / 1000.0;
     const FVector ViewForward = ViewRotation.Vector();
-    bool bSelectedLookupReady = false;
     int32 Examined = 0;
     while (NextCandidate < Candidates.Num())
     {
@@ -514,11 +569,7 @@ void FMISModule::ProcessBatch()
                     Existing = Subsystem->FindTemporaryByBuildableClassAndIndex(Class, Candidate.LightweightIndex);
             if (Existing)
             {
-                if (!bSelectedLookupReady)
-                {
-                    RefreshSelectedActorLookup(State);
-                    bSelectedLookupReady = true;
-                }
+                if (bSelectedActorLookupDirty) RefreshSelectedActorLookup(State);
                 if (SelectedActorLookup.Contains(Existing)) continue;
             }
             PreviewCandidates.Add(Candidate);
@@ -617,7 +668,7 @@ void FMISModule::AddActor(AFGBuildable* Actor)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(ItemSelector_AddActor);
     UFGBuildGunStateDismantle* State = ActiveState.Get();
-    if (!State || State->mPendingDismantleActors.Contains(Actor)) return;
+    if (!State || !BuildableEligibility.IsActorSelectable(Actor) || State->mPendingDismantleActors.Contains(Actor)) return;
     if (MIS::RemainingCapacity(State->GetMaxNumPendingDismantleActors(), State->GetNumPendingDismantleActors(false)) == 0) return;
     const TSubclassOf<AActor> Filter = State->GetCurrentDismantleClassFilter();
     if ((Filter && !Actor->IsA(Filter)) || !State->CanDismantleActor(Actor)) { ++Rejected; return; }
@@ -627,6 +678,7 @@ void FMISModule::AddActor(AFGBuildable* Actor)
     State->mShouldRemoveFromMultiSelect = false;
     State->AddPendingDismantleActor(Actor);
     State->mShouldRemoveFromMultiSelect = bWasRemoving;
+    MarkSelectionChanged();
     if (State->mPendingDismantleActors.Contains(Actor))
     {
         ++Added;
@@ -641,9 +693,11 @@ void FMISModule::AddActor(AFGBuildable* Actor)
 
 void FMISModule::ReleaseTemporaryPins(bool bAll)
 {
+    if (!bAll && !bTemporaryPinsDirty) return;
+    bTemporaryPinsDirty = false;
     if (PinnedTemporaries.IsEmpty()) return;
     TRACE_CPUPROFILER_EVENT_SCOPE(ItemSelector_ReleasePins);
-    if (!bAll) RefreshSelectedActorLookup(ActiveState.Get());
+    if (!bAll && bSelectedActorLookupDirty) RefreshSelectedActorLookup(ActiveState.Get());
     for (int32 I = PinnedTemporaries.Num() - 1; I >= 0; --I)
     {
         AFGBuildable* Actor = PinnedTemporaries[I].Get();
