@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"Version": 2,
+	"Version": 1,
 	"VersionName": "1.1.0",
 	"FriendlyName": "Mass Item Selector",
 	"Description": "Easily select items for dismantle and more",
