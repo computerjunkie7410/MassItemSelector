@@ -16,11 +16,19 @@ constexpr float DefaultWheelStep = 5.f;
 constexpr float MinWheelStep = 0.1f;
 constexpr float MaxWheelStep = MIS::MaxSelectionDistanceMeters;
 
-UConfigPropertySection* GetPreferences(UObject* WorldContext)
+UConfigProperty* GetPreference(UObject* WorldContext, const TCHAR* Name)
 {
     UWorld* World = GEngine ? GEngine->GetWorldFromContextObject(WorldContext, EGetWorldErrorMode::ReturnNull) : nullptr;
     auto* Manager = World && World->GetGameInstance() ? World->GetGameInstance()->GetSubsystem<UConfigManager>() : nullptr;
-    return Manager ? Manager->GetConfigurationRootSection(GetDefault<UMISModConfiguration>()->ConfigId) : nullptr;
+    const auto* Root = Manager ? Manager->GetConfigurationRootSection(GetDefault<UMISModConfiguration>()->ConfigId) : nullptr;
+    return Root ? Root->SectionProperties.FindRef(Name) : nullptr;
+}
+
+EMISDistancePanelSide ReadPanelSide(UObject* WorldContext, const TCHAR* Name)
+{
+    const auto* Property = Cast<UConfigPropertyInteger>(GetPreference(WorldContext, Name));
+    return Property && Property->Value == static_cast<int32>(EMISDistancePanelSide::Right)
+        ? EMISDistancePanelSide::Right : EMISDistancePanelSide::Left;
 }
 }
 
@@ -55,56 +63,47 @@ void UMISModConfiguration::PostInitProperties()
     Wheel->DefaultValue = Wheel->Value = DefaultWheelStep;
     Section->SectionProperties.Add(TEXT("WheelStepMeters"), Wheel);
 
-    auto* Side = NewObject<UCP_Integer>(Section, IntegerClass, TEXT("DistancePanelSide"));
-    Side->bRequiresWorldReload = false;
-    Side->DisplayName = LOCTEXT("PanelSideLabel", "Distance panel side");
-    Side->Tooltip = LOCTEXT("PanelSideTooltip", "Place the distance controls at the top left or top right. Takes effect when Mass Selection is opened.");
-    Side->WidgetType = ECP_IntegerWidgetType::CPI_Enum;
-    Side->EnumClass = StaticEnum<EMISDistancePanelSide>();
-    Side->MinValue = 0;
-    Side->MaxValue = 1;
-    Side->DefaultValue = Side->Value = static_cast<int32>(EMISDistancePanelSide::Left);
-    Section->SectionProperties.Add(TEXT("DistancePanelSide"), Side);
+    auto AddPanelSide = [&](const TCHAR* Name, const FText& Label, const FText& Tooltip) {
+        auto* Property = NewObject<UCP_Integer>(Section, IntegerClass, FName(Name));
+        Property->bRequiresWorldReload = false;
+        Property->DisplayName = Label;
+        Property->Tooltip = Tooltip;
+        Property->WidgetType = ECP_IntegerWidgetType::CPI_Enum;
+        Property->EnumClass = StaticEnum<EMISDistancePanelSide>();
+        Property->MinValue = 0;
+        Property->MaxValue = 1;
+        Property->DefaultValue = Property->Value = static_cast<int32>(EMISDistancePanelSide::Left);
+        Section->SectionProperties.Add(Name, Property);
+    };
 
-    auto* SelectionSide = NewObject<UCP_Integer>(Section, IntegerClass, TEXT("SelectionPanelSide"));
-    SelectionSide->bRequiresWorldReload = false;
-    SelectionSide->DisplayName = LOCTEXT("SelectionPanelSideLabel", "Selection panel side");
-    SelectionSide->Tooltip = LOCTEXT("SelectionPanelSideTooltip", "Place the selected building types on the left or right. Updates immediately.");
-    SelectionSide->WidgetType = ECP_IntegerWidgetType::CPI_Enum;
-    SelectionSide->EnumClass = StaticEnum<EMISDistancePanelSide>();
-    SelectionSide->MinValue = 0;
-    SelectionSide->MaxValue = 1;
-    SelectionSide->DefaultValue = SelectionSide->Value = static_cast<int32>(EMISDistancePanelSide::Left);
-    Section->SectionProperties.Add(TEXT("SelectionPanelSide"), SelectionSide);
+    AddPanelSide(TEXT("DistancePanelSide"), LOCTEXT("PanelSideLabel", "Distance panel side"),
+        LOCTEXT("PanelSideTooltip", "Place the distance controls at the top left or top right. Takes effect when Mass Selection is opened."));
+    AddPanelSide(TEXT("SelectionPanelSide"), LOCTEXT("SelectionPanelSideLabel", "Selection panel side"),
+        LOCTEXT("SelectionPanelSideTooltip", "Place the selected building types on the left or right. Updates immediately."));
 }
 
 UMISGameInstanceModule::UMISGameInstanceModule()
 {
     bRootModule = true;
     ModConfigurations.Add(UMISModConfiguration::StaticClass());
+    ClientBlueprintHooks.Add(TSoftClassPtr<UBlueprintHook>(FSoftObjectPath(
+        TEXT("/MassItemSelector/Hooks/Hook_DismantleHints_MassItemSelector.Hook_DismantleHints_MassItemSelector_C"))));
 }
 
 float UMISConfigurationLibrary::GetWheelStep(UObject* WorldContext)
 {
-    auto* Root = GetPreferences(WorldContext);
-    auto* Property = Root ? Cast<UConfigPropertyFloat>(Root->SectionProperties.FindRef(TEXT("WheelStepMeters"))) : nullptr;
+    const auto* Property = Cast<UConfigPropertyFloat>(GetPreference(WorldContext, TEXT("WheelStepMeters")));
     return Property && FMath::IsFinite(Property->Value) ? FMath::Clamp(Property->Value, MinWheelStep, MaxWheelStep) : DefaultWheelStep;
 }
 
 EMISDistancePanelSide UMISConfigurationLibrary::GetPanelSide(UObject* WorldContext)
 {
-    auto* Root = GetPreferences(WorldContext);
-    auto* Property = Root ? Cast<UConfigPropertyInteger>(Root->SectionProperties.FindRef(TEXT("DistancePanelSide"))) : nullptr;
-    return Property && Property->Value == static_cast<int32>(EMISDistancePanelSide::Right)
-        ? EMISDistancePanelSide::Right : EMISDistancePanelSide::Left;
+    return ReadPanelSide(WorldContext, TEXT("DistancePanelSide"));
 }
 
 EMISDistancePanelSide UMISConfigurationLibrary::GetSelectionPanelSide(UObject* WorldContext)
 {
-    auto* Root = GetPreferences(WorldContext);
-    auto* Property = Root ? Cast<UConfigPropertyInteger>(Root->SectionProperties.FindRef(TEXT("SelectionPanelSide"))) : nullptr;
-    return Property && Property->Value == static_cast<int32>(EMISDistancePanelSide::Right)
-        ? EMISDistancePanelSide::Right : EMISDistancePanelSide::Left;
+    return ReadPanelSide(WorldContext, TEXT("SelectionPanelSide"));
 }
 
 #undef LOCTEXT_NAMESPACE

@@ -4,7 +4,52 @@
 
 A mod for the game Satisfactory.
 
-Quickly and easily select a large number of items at once. Especially helpful for quick dismantling entire factories. Works great with the [Infinite Dismantle](https://ficsit.app/mod/InfiniteDismantle) and [Quick Blueprint](https://ficsit.app/mod/GbFuqjXs12Hw2) mods.
+Quickly and easily select a large number of items at once. Especially helpful for dismantling entire factories quickly. Works great with the [Infinite Dismantle](https://ficsit.app/mod/InfiniteDismantle) and [Quick Blueprint](https://ficsit.app/mod/GbFuqjXs12Hw2) mods.
+
+## Instructions
+
+1. Press `F` to enter Dismantle mode.
+2. Position yourself over the area you want to select.
+3. In **Default dismantle mode**, hold `Left Alt` (rebindable in Options). The camera will freeze and a cursor will appear.
+4. While holding the lasso key, hold the left mouse button and drag around the buildings you want to select. Release the mouse button or lasso key to finish the outline and preview the results.
+5. Adjust the distance setting using your mouse wheel. The distance controls appear in the upper-left corner of your screen by default; their position is configurable in Mod Options.
+6. Left-click once to add matching buildings to the dismantle selection, subject to the current filter and selection limit.
+7. With at least two buildings selected in Default dismantle mode, press `N` (or your configured key) to open the Advanced Dismantle Filter panel and filter the selected buildings (see version 1.1.0 notes below).
+
+The number of buildings you can select depends on the dismantle limit. Pair this mod with Infinite Dismantle to select larger groups of buildings; the 500-meter range, building eligibility, and native filters still apply. Pair it with Quick Blueprint to quickly make or edit blueprints.
+
+### Mod Settings
+
+
+| Setting | Default | Description | Where to change |
+| --- | --- | --- | --- |
+| Lasso selection | Left Alt | Hold to draw a lasso. Press again while previewing to redraw. | Options → Controls → Mass Item Selector |
+| Advanced Dismantle Filter | N | Open or close the filter for selected building types in Default dismantle mode. | Options → Controls → Mass Item Selector |
+| Wheel step (m) | 5 meters | Distance adjustment per mouse-wheel step. Accepts 0.1–500 meters; the total lasso range is limited to 5–500 meters. | Mod Options → Mass Item Selector |
+| Distance panel side | Left | Place distance controls on the left or right. Applies when the lasso is reopened. | Mod Options → Mass Item Selector |
+| Selection panel side | Left | Place the Advanced Dismantle Filter on the left or right. Applies immediately. | Mod Options → Mass Item Selector |
+
+## Mass Item Selector for Dismantling
+
+<video width="640" controls muted loop>
+  <source src="https://i.imgur.com/HwbiF4S.mp4" type="video/mp4">
+</video>
+
+## Mass Item Selector with Quick Blueprint
+
+<video width="640" controls muted loop>
+  <source src="https://i.imgur.com/cHm61pD.mp4" type="video/mp4">
+</video>
+
+## Version 2.0.0
+
+* Made lasso a part of Default dismantle mode.
+* Performance and quality-of-life improvements.
+
+## Version 1.2.0
+
+Upgrade minimum game build to 520140
+
 
 ## Version 1.1.0
 
@@ -13,32 +58,3 @@ Added **Advanced Dismantle Filter**. Select two or more buildings and press `N` 
 The panel appears on the left by default and can be moved to the right in Mod Options.
 
 ![Advanced Dismantle Filter showing selected buildings grouped by type](https://i.imgur.com/wD9Zvhj.png)
-
-## Instructions
-
-1. Press `F` to enter Dismantle mode.
-2. Position yourself over the area you want to dismantle or create a blueprint of.
-3. Press `M` to enter the selection mode. The camera will freeze and a cursor will appear.
-4. Using the cursor draw around the area you want to dismantle/blueprint. The helper message will tell you how many items it found in the area that you selected.
-5. Adjust the distance setting using your mouse wheel to ensure all of your objects will be selected. You can see the current distance in the upper left corner of your screen.
-6. `Left click` once and all the items will get selected.
-
-The number of items that can be selected will depend on the dismantle limitation. Pairing this mod with Infinite Dismantle mod will allow you to dismantle entire factories at once. Or pair it with the Quick Blueprint mod and quickly make/edit blueprints.
-
-### Mod Settings
-
-Open **Mod Options → Mass Item Selector** to change these settings:
-
-| Setting | What it does | Default |
-| --- | --- | --- |
-| Wheel step (m) | Distance added or removed with each mouse-wheel step. Accepts 0.1–500 meters; total selection distance is capped at 500 meters. | 5 meters |
-| Distance panel side | Place the distance controls on the left or right. Reopen selection mode to apply the change. | Left |
-| Selection panel side | Place the Advanced Dismantle Filter on the left or right. Changes take effect immediately. | Left |
-
-## Mass Item Selector for Dismantling
-
-[Watch the dismantling demo](https://i.imgur.com/x7r7jGh.mp4)
-
-## Mass Item Selector with Quick Blueprint
-
-[Watch the Quick Blueprint demo](https://i.imgur.com/mp0q5AJ.mp4)

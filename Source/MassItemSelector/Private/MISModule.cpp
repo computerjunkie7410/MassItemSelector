@@ -1,4 +1,6 @@
 #include "MISModule.h"
+#include "MISInputBindings.h"
+#include "FGInputLibrary.h"
 #include "MISOverlay.h"
 #include "MISHUDHooks.h"
 #include "MISConfiguration.h"
@@ -19,11 +21,8 @@
 #include "FGCharacterPlayer.h"
 #include "FGHUD.h"
 #include "UI/FGBaseUI.h"
-#include "Blueprint/WidgetTree.h"
 #include "Blueprint/UserWidget.h"
 #include "EnhancedInputComponent.h"
-#include "EnhancedInputSubsystems.h"
-#include "Engine/LocalPlayer.h"
 #include "FGLightweightBuildableSubsystem.h"
 #include "FGSplineBuildableInterface.h"
 #include "Framework/Application/SlateApplication.h"
@@ -32,6 +31,7 @@
 #include "HAL/PlatformTime.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "InputCoreTypes.h"
+#include "TimerManager.h"
 #include "Patching/NativeHookManager.h"
 #include "UObject/UObjectArray.h"
 #include "UObject/UObjectIterator.h"
@@ -67,24 +67,16 @@ FVector CenterOf(AFGBuildable* Actor)
 void FMISModule::StartupModule()
 {
     WorldCleanupHook = FWorldDelegates::OnWorldCleanup.AddLambda([this](UWorld* World, bool, bool) {
-        if (ActiveWorld.Get() != World) return;
-        if (ActiveState.IsValid()) EndState(ActiveState.Get());
-        else
-        {
-            UnbindSelectionObserver();
-            ResetSelectionPanel();
-            CloseOverlay();
-            RemoveMassSelectionInput();
-            RemoveMassSelectionHints();
-            RemoveFeedback();
-            ReleaseTemporaryPins(true);
-            BuildableEligibility.Reset();
-            Player.Reset();
-            ActiveWorld.Reset();
-        }
+        if (ActiveWorld.Get() == World) EndState(ActiveState.Get());
     });
 #if !WITH_EDITOR
     auto* CDO = GetMutableDefault<UFGBuildGunStateDismantle>();
+    PrimaryFireHook = SUBSCRIBE_METHOD_VIRTUAL(UFGBuildGunStateDismantle::PrimaryFire_Implementation,
+        CDO, [this](auto& Scope, UFGBuildGunStateDismantle* State) {
+            if (ActiveState.Get() == State && !bSelectionInteractive && !IsApplying() &&
+                State->GetBuildGun()->GetCurrentBuildGunMode() == State->mDefaultDismantleMode &&
+                bLassoKeyDown) Scope.Cancel();
+        });
     TickHook = SUBSCRIBE_METHOD_VIRTUAL_AFTER(UFGBuildGunStateDismantle::TickState_Implementation,
         CDO, [this](UFGBuildGunStateDismantle* State, float) { TickState(State); });
     EndHook = SUBSCRIBE_METHOD_VIRTUAL_AFTER(UFGBuildGunStateDismantle::EndState_Implementation,
@@ -95,12 +87,13 @@ void FMISModule::StartupModule()
         });
     ClearHook = SUBSCRIBE_METHOD_AFTER(UFGBuildGunStateDismantle::ClearPendingSelectedActors,
         [this](UFGBuildGunStateDismantle* State) {
-            if (ActiveState.Get() == State) MarkSelectionChanged();
-            if (ActiveState.Get() == State && !bInsideSelectionMutation) ResetSelectionPanel();
-            if (ActiveState.Get() == State && IsApplying())
-                FinishApply(TEXT("Selection stopped: native dismantle selection was cleared."));
+            if (ActiveState.Get() != State) return;
+            MarkSelectionChanged();
+            if (!bInsideSelectionMutation) ResetSelectionPanel();
+            if (IsApplying())
+                FinishApply(LOCTEXT("NativeSelectionCleared", "Selection stopped: native dismantle selection was cleared."));
         });
-    UE_LOG(LogMIS, Log, TEXT("Item Selector runtime hooks installed; enter dismantle mode and press M for Mass Selection."));
+    UE_LOG(LogMIS, Log, TEXT("Item Selector runtime hooks installed; hold the configured lasso key (Left Alt by default) in Default dismantle mode."));
 #else
     UE_LOG(LogMIS, Log, TEXT("Item Selector editor module loaded; runtime hooks require the packaged game."));
 #endif
@@ -109,15 +102,9 @@ void FMISModule::StartupModule()
 void FMISModule::ShutdownModule()
 {
     FWorldDelegates::OnWorldCleanup.Remove(WorldCleanupHook);
-    if (ActiveState.IsValid()) EndState(ActiveState.Get());
-    else CloseOverlay();
-    UnbindSelectionObserver();
-    ResetSelectionPanel();
-    BuildableEligibility.Reset();
-    RemoveMassSelectionInput();
-    RemoveMassSelectionHints();
-    RemoveFeedback();
+    EndState(ActiveState.Get());
 #if !WITH_EDITOR
+    if (PrimaryFireHook.IsValid()) UNSUBSCRIBE_METHOD(UFGBuildGunStateDismantle::PrimaryFire_Implementation, PrimaryFireHook);
     if (TickHook.IsValid()) UNSUBSCRIBE_METHOD(UFGBuildGunStateDismantle::TickState_Implementation, TickHook);
     if (EndHook.IsValid()) UNSUBSCRIBE_METHOD(UFGBuildGunStateDismantle::EndState_Implementation, EndHook);
     if (AimHook.IsValid()) UNSUBSCRIBE_METHOD(UFGBuildGunStateDismantle::SetAimedAtActor, AimHook);
@@ -145,10 +132,32 @@ void FMISModule::TickState(UFGBuildGunStateDismantle* State)
         bSelectionDirty = true;
         MarkSelectionChanged();
     }
-    InstallMassSelectionInput();
-    UpdateMassSelectionHints();
-    const bool bOpenRequested = bMassSelectionRequested;
-    bMassSelectionRequested = false;
+    InstallDismantleInput();
+    UpdateDismantleHints();
+    if (bExitDismantleRequested)
+    {
+        bExitDismantleRequested = false;
+        CloseSelectionInteraction();
+        CloseOverlay();
+        PC->GetWorld()->GetTimerManager().SetTimerForNextTick(
+            FTimerDelegate::CreateWeakLambda(Character, [Character] { Character->UnequipBuildGun(); }));
+        return;
+    }
+    if (bCycleModeRequested)
+    {
+        bCycleModeRequested = false;
+        Gun->CycleBuildMode(1);
+    }
+    const auto Mode = Gun->GetCurrentBuildGunMode();
+    if (LastDismantleMode.Get() != Mode.Get())
+    {
+        LastDismantleMode = Mode.Get();
+        if (IsApplying()) FinishApply(LOCTEXT("DismantleModeChanged", "Selection stopped: dismantle mode changed."));
+        CloseSelectionInteraction();
+        CloseOverlay();
+    }
+    const bool bLassoKeyPressed = bLassoKeyDown && !bLassoKeyWasDown;
+    bLassoKeyWasDown = bLassoKeyDown;
     TickSelectionPanel();
     if (IsApplying())
     {
@@ -157,13 +166,55 @@ void FMISModule::TickState(UFGBuildGunStateDismantle* State)
     }
     if (Overlay.IsValid())
     {
-        if (!FSlateApplication::Get().IsActive() || PC->IsPaused()) { CloseOverlay(); return; }
-        HideNativeHUD();
-        if ((bPreviewReady || bRefreshPreview) && !ViewIsUnchanged())
+        if (!FSlateApplication::Get().IsActive() || PC->IsPaused())
         {
-            CancelScan();
-            LastResult = TEXT("View changed. Draw a new lasso from this position.");
+            bOverlaySuspended = true;
+            return;
         }
+        if (Overlay->IsDrawingEnabled() && (!bLassoKeyDown || bReleaseLassoRequested))
+        {
+            ReleaseLasso();
+            if (!Overlay.IsValid()) return;
+        }
+        else if (bLassoKeyPressed)
+        {
+            bReleaseLassoRequested = false;
+            Overlay->ClearSelection();
+            Overlay->SetDrawingEnabled(true);
+        }
+        if (bClearLassoRequested)
+        {
+            CloseOverlay();
+            return;
+        }
+        if (PendingLassoWheel != 0)
+        {
+            AdjustDistance(PendingLassoWheel * GetWheelStep());
+            PendingLassoWheel = 0;
+        }
+        if (bApplyLassoRequested && !bScanning && !bRefreshPreview)
+        {
+            bApplyLassoRequested = false;
+            ApplyPreview();
+            if (!Overlay.IsValid()) return;
+        }
+        if (bOverlaySuspended)
+        {
+            bOverlaySuspended = false;
+            if (bLassoInputCaptured) FSlateApplication::Get().SetKeyboardFocus(Overlay);
+        }
+        if (Overlay->HasOutline() && !ViewIsUnchanged())
+        {
+            if (!Overlay->IsDrawingEnabled())
+            {
+                CloseOverlay();
+                return;
+            }
+            Overlay->ClearSelection();
+            LastResult = LOCTEXT("ViewChangedRedraw", "View changed. Draw a new lasso from this position.");
+            ShowFeedback(LastResult);
+        }
+        if (Overlay->IsDrawingEnabled()) Overlay->ResumeInput();
         if (bRefreshPreview && FPlatformTime::Seconds() >= RefreshPreviewAt)
         {
             TArray<FVector2D> Points;
@@ -173,7 +224,7 @@ void FMISModule::TickState(UFGBuildGunStateDismantle* State)
         if (bScanning) ProcessBatch();
     }
     else if (!bSelectionInteractive && SelectionOperations.IsEmpty() && !PC->bShowMouseCursor && !PC->IsPaused() &&
-        bOpenRequested && !PC->IsInputKeyDown(EKeys::LeftMouseButton))
+        bLassoKeyPressed && Mode == State->mDefaultDismantleMode && FSlateApplication::Get().IsActive())
     {
         OpenOverlay();
     }
@@ -185,8 +236,8 @@ void FMISModule::EndState(UFGBuildGunStateDismantle* State)
     UnbindSelectionObserver();
     ResetSelectionPanel();
     CloseOverlay();
-    RemoveMassSelectionInput();
-    RemoveMassSelectionHints();
+    RemoveDismantleInput();
+    RemoveDismantleHints();
     RemoveFeedback();
     ReleaseTemporaryPins(true);
     ActiveState.Reset();
@@ -195,66 +246,105 @@ void FMISModule::EndState(UFGBuildGunStateDismantle* State)
     SelectedActorLookup.Empty();
     bSelectedActorLookupDirty = true;
     BuildableEligibility.Reset();
+    LastDismantleMode.Reset();
+    bCycleModeRequested = false;
+    bExitDismantleRequested = false;
+    bLassoKeyDown = bLassoKeyWasDown = false;
 }
 
-void FMISModule::InstallMassSelectionInput()
+void FMISModule::ExitDismantleMode()
+{
+    bExitDismantleRequested = true;
+}
+
+bool FMISModule::HandleDismantleShortcut(const FKeyEvent& Event)
+{
+    const FKey Key = Event.GetKey();
+    const auto& Modifiers = Event.GetModifierKeys();
+    if (Key == EKeys::Escape && Overlay.IsValid())
+    {
+        if (!Event.IsRepeat()) bClearLassoRequested = true;
+        return true;
+    }
+    if (InputBindings.Dismantle.Matches(Key, Modifiers))
+    {
+        if (!Event.IsRepeat()) ExitDismantleMode();
+        return true;
+    }
+    if (InputBindings.Close.Matches(Key, Modifiers))
+    {
+        if (!Event.IsRepeat())
+        {
+            if (bSelectionInteractive) CloseSelectionInteraction();
+            else if (Overlay.IsValid()) bClearLassoRequested = true;
+            else ExitDismantleMode();
+        }
+        return true;
+    }
+    if (InputBindings.CycleMode.Matches(Key, Modifiers))
+    {
+        if (!Event.IsRepeat()) bCycleModeRequested = true;
+        return true;
+    }
+    if (bSelectionInteractive && InputBindings.SelectionFilter.Matches(Key, Modifiers))
+    {
+        if (!Event.IsRepeat()) CloseSelectionInteraction();
+        return true;
+    }
+    return false;
+}
+
+void FMISModule::InstallDismantleInput()
 {
     auto* PC = Player.Get();
     auto* Input = PC ? Cast<UEnhancedInputComponent>(PC->InputComponent) : nullptr;
-    auto* Subsystem = PC && PC->GetLocalPlayer()
-        ? PC->GetLocalPlayer()->GetSubsystem<UEnhancedInputLocalPlayerSubsystem>() : nullptr;
-    if (!Input || !Subsystem || MassSelectionInput.Get() == Input) return;
-    RemoveMassSelectionInput();
-    if (!MassSelectionAction.IsValid())
-    {
-        MassSelectionAction.Reset(NewObject<UInputAction>());
-        MassSelectionAction->ActionDescription = LOCTEXT("MassSelection", "Mass Selection");
-        MassSelectionAction->bConsumeInput = true;
-        MassSelectionContext.Reset(NewObject<UInputMappingContext>());
-        MassSelectionContext->MapKey(MassSelectionAction.Get(), EKeys::M);
-        SelectionPanelAction.Reset(NewObject<UInputAction>());
-        SelectionPanelAction->ActionDescription = LOCTEXT("SelectionPanelAction", "Advanced Dismantle Filter");
-        SelectionPanelAction->bConsumeInput = true;
-        MassSelectionContext->MapKey(SelectionPanelAction.Get(), EKeys::N);
-    }
-    MassSelectionBinding = Input->BindActionValueLambda(MassSelectionAction.Get(), ETriggerEvent::Started,
-        [this](const FInputActionValue&) { bMassSelectionRequested = true; }).GetHandle();
-    SelectionPanelBinding = Input->BindActionValueLambda(SelectionPanelAction.Get(), ETriggerEvent::Started,
+    if (!Input || DismantleInput.Get() == Input) return;
+    RemoveDismantleInput();
+    InputBindings.Update(PC);
+    SelectionPanelBinding = Input->BindActionValueLambda(InputBindings.SelectionFilter.Action.Get(), ETriggerEvent::Started,
         [this](const FInputActionValue&) { bSelectionRequested = true; }).GetHandle();
-    MassSelectionInput = Input;
-    MassSelectionSubsystem = Subsystem;
-    Subsystem->AddMappingContext(MassSelectionContext.Get(), 10000);
+    DismantleInput = Input;
+    LassoAction.Reset(MIS::GetLassoAction());
+    UFGInputLibrary::GetCurrentMappingForAction(PC, MIS::LassoMappingName, LassoKey, LassoModifiers);
+    LassoBindings.Add(Input->BindActionValueLambda(LassoAction.Get(), ETriggerEvent::Started,
+        [this](const FInputActionValue&) { bLassoKeyDown = true; }).GetHandle());
+    auto ReleaseKey = [this](const FInputActionValue&) { bLassoKeyDown = false; bReleaseLassoRequested = true; };
+    LassoBindings.Add(Input->BindActionValueLambda(LassoAction.Get(), ETriggerEvent::Completed, ReleaseKey).GetHandle());
+    LassoBindings.Add(Input->BindActionValueLambda(LassoAction.Get(), ETriggerEvent::Canceled, ReleaseKey).GetHandle());
+    LassoInputProcessor = CreateLassoInputProcessor();
+    FSlateApplication::Get().RegisterInputPreProcessor(LassoInputProcessor);
 }
 
-void FMISModule::RemoveMassSelectionInput()
+void FMISModule::RemoveDismantleInput()
 {
-    if (auto* Input = MassSelectionInput.Get())
+    if (LassoInputProcessor) FSlateApplication::Get().UnregisterInputPreProcessor(LassoInputProcessor);
+    LassoInputProcessor.Reset();
+    if (auto* Input = DismantleInput.Get())
     {
-        Input->RemoveBindingByHandle(MassSelectionBinding);
         Input->RemoveBindingByHandle(SelectionPanelBinding);
+        for (uint32 Binding : LassoBindings) Input->RemoveBindingByHandle(Binding);
     }
-    if (auto* Subsystem = MassSelectionSubsystem.Get())
-        if (MassSelectionContext.IsValid()) Subsystem->RemoveMappingContext(MassSelectionContext.Get());
-    MassSelectionInput.Reset();
-    MassSelectionSubsystem.Reset();
-    MassSelectionBinding = 0;
-    bMassSelectionRequested = false;
+    LassoBindings.Reset();
+    LassoAction.Reset();
+    DismantleInput.Reset();
+    SelectionPanelBinding = 0;
     bSelectionRequested = false;
 }
 
-void FMISModule::RemoveMassSelectionHints()
+void FMISModule::RemoveDismantleHints()
 {
-    for (const auto& WeakTarget : MassSelectionHintTargets)
-        if (auto* Target = WeakTarget.Get())
+    for (auto& Pair : DismantleHintTargets)
+        if (auto* Target = Pair.Key.Get())
             if (Target->GetWorld() && !Target->GetWorld()->bIsTearingDown)
-                UMISHUDHooks::UpdateMassSelectionHint(Target, true);
-    MassSelectionHintTargets.Reset();
+                UMISHUDHooks::UpdateDismantleHints(Target, EMISDismantleHints::Native, Pair.Value, Player.Get(), InputBindings);
+    DismantleHintTargets.Reset();
+    UMISHUDHooks::ClearNativeHintState();
     NextHintScan = 0;
     NextHintUpdate = 0;
     HintHUDRoot.Reset();
 }
 
-void FMISModule::UpdateMassSelectionHints()
+void FMISModule::UpdateDismantleHints()
 {
     auto* PC = Player.Get();
     const double Now = FPlatformTime::Seconds();
@@ -263,30 +353,46 @@ void FMISModule::UpdateMassSelectionHints()
     UUserWidget* Root = HUD ? HUD->GetBaseUI() : nullptr;
     if (Root != HintHUDRoot.Get())
     {
-        RemoveMassSelectionHints();
+        RemoveDismantleHints();
         HintHUDRoot = Root;
     }
     NextHintUpdate = Now + 0.25;
-    MassSelectionHintTargets.RemoveAll([PC](const auto& Target) {
-        return !Target.IsValid() || Target->GetWorld() != PC->GetWorld() ||
-            (Target->GetOwningPlayer() && Target->GetOwningPlayer() != PC);
-    });
-    for (const auto& Target : MassSelectionHintTargets)
-        UMISHUDHooks::UpdateMassSelectionHint(Target.Get(), false);
-    if (!MassSelectionHintTargets.IsEmpty() && Now < NextHintScan) return;
+    InputBindings.Update(PC);
+    FKey ConfiguredKey;
+    TArray<FKey> ConfiguredModifiers;
+    UFGInputLibrary::GetCurrentMappingForAction(PC, MIS::LassoMappingName, ConfiguredKey, ConfiguredModifiers);
+    if (ConfiguredKey != LassoKey || ConfiguredModifiers != LassoModifiers)
+    {
+        LassoKey = ConfiguredKey;
+        LassoModifiers = MoveTemp(ConfiguredModifiers);
+        bLassoKeyDown = bLassoKeyWasDown = false;
+        bReleaseLassoRequested = Overlay.IsValid();
+    }
+    for (auto It = DismantleHintTargets.CreateIterator(); It; ++It)
+    {
+        auto* Target = It.Key().Get();
+        if (!Target || Target->GetWorld() != PC->GetWorld() ||
+            (Target->GetOwningPlayer() && Target->GetOwningPlayer() != PC)) It.RemoveCurrent();
+    }
+    auto* State = ActiveState.Get();
+    EMISDismantleHints Mode = EMISDismantleHints::Native;
+    if (Overlay.IsValid())
+        Mode = Overlay->IsDrawingEnabled() ? EMISDismantleHints::Draw : EMISDismantleHints::Preview;
+    else if (State && State->GetBuildGun()->GetCurrentBuildGunMode() == State->mDefaultDismantleMode)
+        Mode = bSelectionInteractive || State->GetNumPendingDismantleActors(false) > 1
+            ? EMISDismantleHints::Selection : EMISDismantleHints::Default;
+    for (auto& Pair : DismantleHintTargets)
+        UMISHUDHooks::UpdateDismantleHints(Pair.Key.Get(), Mode, Pair.Value, PC, InputBindings);
+    if (!DismantleHintTargets.IsEmpty() && Now < NextHintScan) return;
     NextHintScan = Now + 2.0;
     for (TObjectIterator<UUserWidget> It; It; ++It)
     {
         auto* Target = *It;
         if (Target->IsTemplate() || Target->GetClass()->GetFName() != TEXT("Widget_DismantleMode_C") ||
             Target->GetWorld() != PC->GetWorld() || (Target->GetOwningPlayer() && Target->GetOwningPlayer() != PC)) continue;
-        if (!MassSelectionHintTargets.Contains(Target))
-        {
-            MassSelectionHintTargets.Add(Target);
-            UMISHUDHooks::UpdateMassSelectionHint(Target, false);
-        }
+        if (!DismantleHintTargets.Contains(Target))
+            UMISHUDHooks::UpdateDismantleHints(Target, Mode, DismantleHintTargets.Add(Target), PC, InputBindings);
     }
-    MassSelectionHintTargets.RemoveAll([](const auto& Target) { return !Target.IsValid(); });
 }
 
 void FMISModule::OpenOverlay()
@@ -311,23 +417,17 @@ void FMISModule::OpenOverlay()
         MaxDistance.AsVariable()->Set(LastAutomaticFar, ECVF_SetByConsole);
     }
     RemoveFeedback();
-    HideNativeHUD();
     State->ResetBuildGunDelay();
     State->SetAimedAtActor(nullptr);
     bPreviousCursor = PC->bShowMouseCursor;
-    PC->SetIgnoreLookInput(true);
-    PC->SetIgnoreMoveInput(true);
     Overlay = SNew(SMISOverlay).Owner(this);
     if (SelectionPanel.IsValid()) SelectionPanel->SetVisibility(EVisibility::Collapsed);
     OpenViewport = Viewport;
     Viewport->AddViewportWidgetContent(Overlay.ToSharedRef(), 100);
-    PC->bShowMouseCursor = true;
-    FInputModeUIOnly Mode;
-    Mode.SetWidgetToFocus(Overlay);
-    Mode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
-    PC->SetInputMode(Mode);
-    FSlateApplication::Get().SetKeyboardFocus(Overlay);
-    LastResult = TEXT("Make a selection. Drag with the left mouse button.");
+    SetLassoInputCaptured(true);
+    LastResult = FText::GetEmpty();
+    NextHintUpdate = 0;
+    UpdateDismantleHints();
 }
 
 void FMISModule::CloseOverlay()
@@ -338,44 +438,56 @@ void FMISModule::CloseOverlay()
 
 void FMISModule::ReleaseOverlay()
 {
-    RestoreNativeHUD();
+    bOverlaySuspended = false;
     if (!Overlay.IsValid()) return;
+    SetLassoInputCaptured(false);
+    bReleaseLassoRequested = bApplyLassoRequested = bClearLassoRequested = false;
+    PendingLassoWheel = 0;
     TSharedPtr<SMISOverlay> Closing = Overlay;
     Overlay.Reset();
+    NextHintUpdate = 0;
+    UpdateDismantleHints();
     if (OpenViewport.IsValid()) OpenViewport->RemoveViewportWidgetContent(Closing.ToSharedRef());
     OpenViewport.Reset();
-    if (APlayerController* PC = Player.Get())
-    {
-        PC->SetIgnoreLookInput(false);
-        PC->SetIgnoreMoveInput(false);
-        PC->bShowMouseCursor = bPreviousCursor;
-        PC->SetInputMode(FInputModeGameOnly());
-    }
 }
 
-void FMISModule::RestoreNativeHUD()
+void FMISModule::SetLassoInputCaptured(bool bCapture)
 {
-    if (auto* Widget = HiddenHUDWidget.Get()) Widget->SetVisibility(PreviousHUDVisibility);
-    HiddenHUDWidget.Reset();
-}
-
-void FMISModule::HideNativeHUD()
-{
-    auto* PC = Player.Get();
-    auto* HUD = PC ? Cast<AFGHUD>(PC->GetHUD()) : nullptr;
-    UUserWidget* Widget = HUD ? HUD->GetBaseUI() : nullptr;
-    if (Widget != HiddenHUDWidget.Get())
+    if (bLassoInputCaptured == bCapture) return;
+    bLassoInputCaptured = bCapture;
+    if (bCapture) bReleaseLassoRequested = false;
+    Overlay->SetDrawingEnabled(bCapture);
+    Overlay->SetVisibility(bCapture ? EVisibility::Visible : EVisibility::HitTestInvisible);
+    if (auto* PC = Player.Get())
     {
-        RestoreNativeHUD();
-        if (Widget)
+        PC->SetIgnoreLookInput(bCapture);
+        PC->SetIgnoreMoveInput(bCapture);
+        PC->bShowMouseCursor = bCapture ? true : bPreviousCursor;
+        if (bCapture)
         {
-            HiddenHUDWidget = Widget;
-            PreviousHUDVisibility = Widget->GetVisibility();
-            UE_LOG(LogMIS, Log, TEXT("Hiding native HUD root %s during lasso."), *Widget->GetName());
+            FInputModeGameAndUI Mode;
+            Mode.SetWidgetToFocus(Overlay);
+            Mode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+            PC->SetInputMode(Mode);
+            FSlateApplication::Get().SetKeyboardFocus(Overlay);
+        }
+        else
+        {
+            FSlateApplication::Get().ReleaseAllPointerCapture();
+            PC->SetInputMode(FInputModeGameOnly());
         }
     }
-    if (Widget && Widget->GetVisibility() != ESlateVisibility::Hidden)
-        Widget->SetVisibility(ESlateVisibility::Hidden);
+}
+
+void FMISModule::ReleaseLasso()
+{
+    bReleaseLassoRequested = false;
+    if (!Overlay->FinishStroke() || StrokeSize.X <= 0)
+    {
+        ReleaseOverlay();
+        return;
+    }
+    Overlay->SetDrawingEnabled(false);
 }
 
 void FMISModule::BeginStroke()
@@ -387,6 +499,12 @@ void FMISModule::BeginStroke()
         PC->GetViewportSize(ViewportSize.X, ViewportSize.Y);
         ViewFOV = PC->PlayerCameraManager ? PC->PlayerCameraManager->GetFOVAngle() : 0;
     }
+}
+
+bool FMISModule::IsDefaultDismantleMode() const
+{
+    const auto* State = ActiveState.Get();
+    return State && LastDismantleMode.IsValid() && LastDismantleMode.Get() == State->mDefaultDismantleMode.Get();
 }
 
 bool FMISModule::ViewIsUnchanged() const
@@ -412,12 +530,14 @@ void FMISModule::StartSelection(const TArray<FVector2D>& Points, FVector2D Local
     for (const FVector2D P : Points) Polygon.Add({ P.X, P.Y });
     if (!MIS::IsUsable({ Polygon.GetData(), static_cast<size_t>(Polygon.Num()) }))
     {
-        LastResult = TEXT("Outline too small or flat; draw an area.");
+        LastResult = LOCTEXT("InvalidOutline", "Outline too small or flat; draw an area.");
+        ShowFeedback(LastResult);
         return;
     }
     if (!ViewIsUnchanged() || ViewportSize.X <= 0 || ViewportSize.Y <= 0)
     {
-        LastResult = TEXT("Camera moved or viewport resized. Stop moving and redraw.");
+        LastResult = LOCTEXT("CameraChanged", "Camera moved or viewport resized. Stop moving and redraw.");
+        ShowFeedback(LastResult);
         return;
     }
     StrokeSize = LocalSize;
@@ -430,37 +550,16 @@ void FMISModule::StartSelection(const TArray<FVector2D>& Points, FVector2D Local
         PolygonMax.X = FMath::Max(PolygonMax.X, P.X + 0.5);
         PolygonMax.Y = FMath::Max(PolygonMax.Y, P.Y + 0.5);
     }
-    TRACE_CPUPROFILER_EVENT_SCOPE(ItemSelector_Snapshot);
-    if (AFGBuildableSubsystem* Subsystem = AFGBuildableSubsystem::Get(PC))
-        for (AFGBuildable* Actor : Subsystem->GetAllBuildablesRef())
-            if (IsValid(Actor) && !Actor->GetIsLightweightTemporary())
-            {
-                const FVector Center = CenterOf(Actor);
-                if (!IsCenterInRange(Center) || !BuildableEligibility.IsActorSelectable(Actor)) continue;
-                FCandidate& Candidate = Candidates.AddDefaulted_GetRef();
-                Candidate.Actor = Actor;
-                Candidate.Center = Center;
-            }
-    if (auto* Lightweight = AFGLightweightBuildableSubsystem::Get(PC->GetWorld()))
-        for (const auto& Pair : Lightweight->GetAllLightweightBuildableInstances())
-            for (int32 Index = 0; Index < Pair.Value.Num(); ++Index)
-            {
-                const auto& Data = Pair.Value[Index];
-                if (!Data.IsValid()) continue;
-                const FVector Center = Data.BoundingBox.IsValid
-                    ? Data.Transform.TransformPosition(Data.BoundingBox.GetCenter()) : Data.Transform.GetLocation();
-                if (!IsCenterInRange(Center) || !BuildableEligibility.IsTypeSelectable(Pair.Key.Get(),
-                    UFGRecipe::GetDescriptorForRecipe(Data.BuiltWithRecipe))) continue;
-                FCandidate& Candidate = Candidates.AddDefaulted_GetRef();
-                Candidate.LightweightClass = Pair.Key.Get();
-                Candidate.LightweightIndex = Index;
-                Candidate.Transform = Data.Transform;
-                Candidate.Center = Center;
-            }
+    if (auto* Subsystem = AFGBuildableSubsystem::Get(PC))
+        BuildableCount = Subsystem->GetAllBuildablesRef().Num();
+    if (auto* Subsystem = AFGLightweightBuildableSubsystem::Get(PC->GetWorld()))
+        for (const auto& Pair : Subsystem->GetAllLightweightBuildableInstances())
+            LightweightScans.Add({ Pair.Key.Get(), Pair.Value.Num() });
+    bGatheringCandidates = true;
     NextCandidate = Added = Rejected = 0;
     bScanning = true;
     bApplying = false;
-    LastResult = TEXT("Counting objects in range; nothing added yet.");
+    LastResult = LOCTEXT("GatheringCandidates", "Counting objects in range; nothing added yet.");
 }
 
 void FMISModule::ApplyPreview()
@@ -469,7 +568,8 @@ void FMISModule::ApplyPreview()
     if (!ViewIsUnchanged())
     {
         CancelScan();
-        LastResult = TEXT("View changed. Draw a new lasso before adding objects.");
+        LastResult = LOCTEXT("ViewChangedApply", "View changed. Draw a new lasso before adding objects.");
+        ShowFeedback(LastResult);
         return;
     }
     if (StrokeFarMeters != GetFarDistance())
@@ -477,10 +577,11 @@ void FMISModule::ApplyPreview()
         QueuePreviewRefresh();
         return;
     }
-    const int32 Limit = ActiveState->GetMaxNumPendingDismantleActors();
-    if (MIS::RemainingCapacity(Limit, ActiveState->GetNumPendingDismantleActors(false)) == 0)
+    auto* State = ActiveState.Get();
+    const int32 Limit = State->GetMaxNumPendingDismantleActors();
+    if (MIS::RemainingCapacity(Limit, State->GetNumPendingDismantleActors(false)) == 0)
     {
-        FinishApply(FString::Printf(TEXT("Added 0 objects: dismantle limit (%d) already reached. Clear some selection before adding more."), Limit));
+        FinishApply(FText::Format(LOCTEXT("SelectionAlreadyFull", "Added 0 objects: dismantle limit ({0}) already reached. Clear some selection before adding more."), Limit));
         return;
     }
     Candidates = MoveTemp(PreviewCandidates);
@@ -488,7 +589,7 @@ void FMISModule::ApplyPreview()
     bPreviewReady = false;
     bApplying = bScanning = true;
     ReleaseOverlay();
-    ShowFeedback(TEXT(""), true);
+    ShowFeedback(FText::GetEmpty(), true);
 }
 
 bool FMISModule::HasObjectHeadroom() const
@@ -523,6 +624,71 @@ void FMISModule::RefreshSelectedActorLookup(const UFGBuildGunStateDismantle* Sta
     for (AActor* Actor : State->mPendingDismantleActors) SelectedActorLookup.Add(Actor);
 }
 
+void FMISModule::UpdateSelectedActorLookup(const UFGBuildGunStateDismantle* State, AActor* Actor, int32 PreviousCount)
+{
+    if (State->mPendingDismantleActors.Num() == PreviousCount + 1 && State->mPendingDismantleActors.Last() == Actor)
+    {
+        SelectedActorLookup.Add(Actor);
+        bSelectedActorLookupDirty = false;
+    }
+    else RefreshSelectedActorLookup(State);
+}
+
+bool FMISModule::GatherCandidates(double Deadline)
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(ItemSelector_Snapshot);
+    auto* PC = Player.Get();
+    auto* Buildables = AFGBuildableSubsystem::Get(PC);
+    auto* Lightweight = AFGLightweightBuildableSubsystem::Get(PC->GetWorld());
+    int32 Examined = 0;
+    while (NextBuildable < BuildableCount || NextLightweightClass < LightweightScans.Num())
+    {
+        if (Examined++ > 0 && FPlatformTime::Seconds() >= Deadline) return false;
+        FCandidate Candidate;
+        if (NextBuildable < BuildableCount)
+        {
+            const auto* Actors = Buildables ? &Buildables->GetAllBuildablesRef() : nullptr;
+            if (!Actors || !Actors->IsValidIndex(NextBuildable))
+            {
+                NextBuildable = BuildableCount;
+                continue;
+            }
+            AFGBuildable* Actor = (*Actors)[NextBuildable++];
+            if (!IsValid(Actor) || Actor->GetIsLightweightTemporary()) continue;
+            Candidate.Center = CenterOf(Actor);
+            if (!IsCenterInRange(Candidate.Center) || !BuildableEligibility.IsActorSelectable(Actor)) continue;
+            Candidate.Actor = Actor;
+        }
+        else
+        {
+            const auto& Scan = LightweightScans[NextLightweightClass];
+            UClass* Class = Scan.Class.Get();
+            const auto* Instances = Lightweight && Class
+                ? Lightweight->GetAllLightweightBuildableInstances().Find(Class) : nullptr;
+            if (!Instances || NextLightweightInstance >= FMath::Min(Scan.Count, Instances->Num()))
+            {
+                ++NextLightweightClass;
+                NextLightweightInstance = 0;
+                continue;
+            }
+            const int32 Index = NextLightweightInstance++;
+            const auto& Data = (*Instances)[Index];
+            if (!Data.IsValid()) continue;
+            Candidate.Center = Data.BoundingBox.IsValid
+                ? Data.Transform.TransformPosition(Data.BoundingBox.GetCenter()) : Data.Transform.GetLocation();
+            if (!IsCenterInRange(Candidate.Center) || !BuildableEligibility.IsTypeSelectable(Class,
+                UFGRecipe::GetDescriptorForRecipe(Data.BuiltWithRecipe))) continue;
+            Candidate.LightweightClass = Class;
+            Candidate.LightweightIndex = Index;
+            Candidate.Transform = Data.Transform;
+        }
+        Candidates.Add(Candidate);
+    }
+    LightweightScans.Reset();
+    bGatheringCandidates = false;
+    return true;
+}
+
 void FMISModule::ProcessBatch()
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(ItemSelector_ProcessBatch);
@@ -533,13 +699,18 @@ void FMISModule::ProcessBatch()
         const bool bWasApplying = bApplying;
         CancelScan();
         LastResult = bWasApplying
-            ? TEXT("Selection stopped: player or dismantle state unavailable. Already-added objects remain selected.")
-            : TEXT("Preview stopped: view changed. Selection unchanged; draw a new lasso.");
+            ? LOCTEXT("ApplyStateUnavailable", "Selection stopped: player or dismantle state unavailable. Already-added objects remain selected.")
+            : LOCTEXT("PreviewViewChanged", "Preview stopped: view changed. Selection unchanged; draw a new lasso.");
         if (bWasApplying) FinishApply(LastResult);
+        else ShowFeedback(LastResult);
         return;
     }
     const double Deadline = FPlatformTime::Seconds() +
         FMath::Clamp(BatchMilliseconds.GetValueOnGameThread(), 0.25f, 16.f) / 1000.0;
+    if (bGatheringCandidates)
+    {
+        if (!GatherCandidates(Deadline) || FPlatformTime::Seconds() >= Deadline) return;
+    }
     const FVector ViewForward = ViewRotation.Vector();
     int32 Examined = 0;
     while (NextCandidate < Candidates.Num())
@@ -549,7 +720,7 @@ void FMISModule::ProcessBatch()
         {
             const int32 AddedBeforeStop = Added;
             CancelScan();
-            LastResult = FString::Printf(TEXT("Added %d objects. Dismantle limit (%d) reached; remaining lasso objects were not added."), AddedBeforeStop, Limit);
+            LastResult = FText::Format(LOCTEXT("SelectionLimitReached", "Added {0} objects. Dismantle limit ({1}) reached; remaining lasso objects were not added."), AddedBeforeStop, Limit);
             FinishApply(LastResult);
             return;
         }
@@ -579,8 +750,8 @@ void FMISModule::ProcessBatch()
         if (!HasObjectHeadroom())
         {
             CancelScan();
-            LastResult = TEXT("Stopped: engine object budget is low. Partial additions remain; clear selection and save/reload before retrying.");
-            UE_LOG(LogMIS, Warning, TEXT("%s"), *LastResult);
+            LastResult = LOCTEXT("ObjectBudgetLow", "Stopped: engine object budget is low. Partial additions remain; clear selection and save/reload before retrying.");
+            UE_LOG(LogMIS, Warning, TEXT("%s"), *LastResult.ToString());
             FinishApply(LastResult);
             return;
         }
@@ -602,22 +773,14 @@ void FMISModule::ProcessBatch()
     }
     if (NextCandidate >= Candidates.Num())
     {
-        bScanning = false;
         if (!bApplying)
         {
-            bPreviewReady = !PreviewCandidates.IsEmpty();
-            const int32 Limit = State->GetMaxNumPendingDismantleActors();
-            const int32 Remaining = MIS::RemainingCapacity(Limit, State->GetNumPendingDismantleActors(false));
-            const int32 Addable = FMath::Min(PreviewCandidates.Num(), Remaining);
-            const int32 AfterPreview = Remaining - Addable;
-            LastResult = bPreviewReady
-                ? FString::Printf(TEXT("Preview: up to %d new objects. If all are added: room for %d more (dismantle limit %d). Left-click to add, or drag to redraw."), Addable, AfterPreview, Limit)
-                : TEXT("No new objects in this outline and distance band.");
-            Candidates.Reset();
+            FinishPreview();
             return;
         }
-        bApplying = false;
-        LastResult = FString::Printf(TEXT("Added %d objects; %d rejected by native dismantle rules/filter."), Added, Rejected);
+        bScanning = bApplying = false;
+        UE_LOG(LogMIS, Verbose, TEXT("%d objects rejected by native dismantle rules/filter."), Rejected);
+        LastResult = FText::Format(LOCTEXT("SelectionAdded", "Added {0} objects."), Added);
         FinishApply(LastResult);
     }
 }
@@ -630,16 +793,26 @@ void FMISModule::RemoveFeedback()
     FeedbackViewport.Reset();
 }
 
-void FMISModule::FinishApply(const FString& Message)
+void FMISModule::FinishPreview()
 {
-    const FString Result = Message;
+    bScanning = false;
+    bPreviewReady = true;
+    NextHintUpdate = 0;
+    LastResult = FText::Format(LOCTEXT("SelectionFound", "Found {0} objects."), PreviewCandidates.Num());
+    Candidates.Reset();
+    ShowFeedback(LastResult);
+}
+
+void FMISModule::FinishApply(const FText& Message)
+{
+    const FText Result = Message;
     CloseOverlay();
     LastResult = Result;
-    UE_LOG(LogMIS, Log, TEXT("%s"), *Result);
+    UE_LOG(LogMIS, Log, TEXT("%s"), *Result.ToString());
     ShowFeedback(Result);
 }
 
-void FMISModule::ShowFeedback(const FString& Message, bool bProgress)
+void FMISModule::ShowFeedback(const FText& Message, bool bProgress)
 {
     const auto* PC = Player.Get();
     UGameViewportClient* Viewport = PC && PC->GetWorld() ? PC->GetWorld()->GetGameViewport() : nullptr;
@@ -655,7 +828,7 @@ void FMISModule::ShowFeedback(const FString& Message, bool bProgress)
             .BorderBackgroundColor(FLinearColor(0.02f, 0.02f, 0.02f, 0.9f)).Padding(12)
             [ SNew(STextBlock).WrapTextAt(850).Justification(ETextJustify::Center)
                 .ColorAndOpacity(FLinearColor::White)
-                .Text_Lambda([this, FixedMessage = FText::FromString(Message), bProgress] {
+                .Text_Lambda([this, FixedMessage = Message, bProgress] {
                     return bProgress ? GetActivityStatus() : FixedMessage;
                 }) ]
         ];
@@ -668,18 +841,22 @@ void FMISModule::AddActor(AFGBuildable* Actor)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(ItemSelector_AddActor);
     UFGBuildGunStateDismantle* State = ActiveState.Get();
-    if (!State || !BuildableEligibility.IsActorSelectable(Actor) || State->mPendingDismantleActors.Contains(Actor)) return;
+    if (!State || !BuildableEligibility.IsActorSelectable(Actor)) return;
+    if (bSelectedActorLookupDirty) RefreshSelectedActorLookup(State);
+    if (SelectedActorLookup.Contains(Actor)) return;
     if (MIS::RemainingCapacity(State->GetMaxNumPendingDismantleActors(), State->GetNumPendingDismantleActors(false)) == 0) return;
     const TSubclassOf<AActor> Filter = State->GetCurrentDismantleClassFilter();
     if ((Filter && !Actor->IsA(Filter)) || !State->CanDismantleActor(Actor)) { ++Rejected; return; }
     const bool bPin = Actor->GetIsLightweightTemporary() && !Actor->GetBlockCleanupOfTemporary();
     if (bPin) Actor->SetBlockCleanupOfTemporary(true);
-    const bool bWasRemoving = State->mShouldRemoveFromMultiSelect;
-    State->mShouldRemoveFromMultiSelect = false;
-    State->AddPendingDismantleActor(Actor);
-    State->mShouldRemoveFromMultiSelect = bWasRemoving;
+    const int32 PreviousCount = State->mPendingDismantleActors.Num();
+    {
+        TGuardValue<bool> RemoveGuard(State->mShouldRemoveFromMultiSelect, false);
+        State->AddPendingDismantleActor(Actor);
+    }
     MarkSelectionChanged();
-    if (State->mPendingDismantleActors.Contains(Actor))
+    UpdateSelectedActorLookup(State, Actor, PreviousCount);
+    if (SelectedActorLookup.Contains(Actor))
     {
         ++Added;
         if (bPin) PinnedTemporaries.Add(Actor);
@@ -711,12 +888,15 @@ void FMISModule::ReleaseTemporaryPins(bool bAll)
 
 void FMISModule::CancelScan()
 {
-    if (bScanning && bApplying) LastResult = FString::Printf(TEXT("Stopped. %d objects already added remain selected."), Added);
-    else if (bScanning || bPreviewReady || bRefreshPreview) LastResult = TEXT("Preview cancelled. Selection unchanged.");
+    if (bScanning && bApplying) LastResult = FText::Format(LOCTEXT("LassoApplyStopped", "Stopped. {0} objects already added remain selected."), Added);
+    else if (bScanning || bPreviewReady || bRefreshPreview) LastResult = LOCTEXT("PreviewCancelled", "Preview cancelled. Selection unchanged.");
     bScanning = false;
     bApplying = bPreviewReady = bRefreshPreview = false;
     Candidates.Reset();
     PreviewCandidates.Reset();
+    LightweightScans.Reset();
+    NextBuildable = BuildableCount = NextLightweightClass = NextLightweightInstance = 0;
+    bGatheringCandidates = false;
     NextCandidate = 0;
 }
 
@@ -727,6 +907,8 @@ void FMISModule::AdjustDistance(float DeltaMeters)
 
 void FMISModule::DiscardPreview()
 {
+    RemoveFeedback();
+    NextHintUpdate = 0;
     CancelScan();
     Polygon.Reset();
     StrokeSize = FVector2D::ZeroVector;
@@ -754,7 +936,8 @@ void FMISModule::QueuePreviewRefresh()
     CancelScan();
     bRefreshPreview = !Polygon.IsEmpty() && StrokeSize.X > 0 && ViewIsUnchanged();
     RefreshPreviewAt = FPlatformTime::Seconds() + 0.2;
-    LastResult = bRefreshPreview ? TEXT("Range changed; refreshing preview...") : TEXT("Range changed. Draw a lasso from this view.");
+    LastResult = FText::GetEmpty();
+    RemoveFeedback();
 }
 
 void FMISModule::SetFarDistance(float Meters)
@@ -768,6 +951,7 @@ void FMISModule::SetFarDistance(float Meters)
 
 FText FMISModule::GetActivityStatus() const
 {
+    if (bGatheringCandidates) return LastResult;
     return ActivityTextCache.Get(bScanning, bApplying, NextCandidate,
         Candidates.Num(), PreviewCandidates.Num(), LastResult);
 }
