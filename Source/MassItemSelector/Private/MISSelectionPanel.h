@@ -52,6 +52,12 @@ struct FMISSelectionSnapshotEntry
     }
 };
 
+struct FMISSelectionOperation
+{
+    FMISSelectionObject Object;
+    bool bRestore = false;
+};
+
 struct FMISSelectionType
 {
     TWeakObjectPtr<UClass> Class;
@@ -61,6 +67,7 @@ struct FMISSelectionType
     uint32 NameTextRevision = MAX_uint32;
     int32 Selected = 0;
     int32 Excluded = 0;
+    TOptional<bool> PendingEnabled;
     FText Label;
     FText CachedName;
     int32 CachedCount = INDEX_NONE;

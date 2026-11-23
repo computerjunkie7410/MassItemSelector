@@ -6,7 +6,6 @@
 #include "MISBuildableEligibility.h"
 #include "FGRecipe.h"
 #include "FGCustomizationRecipe.h"
-#include "FGFactoryColoringTypes.h"
 #include "Buildables/FGBuildable.h"
 #include "Equipment/FGBuildGunDismantle.h"
 #include "FGLightweightBuildableSubsystem.h"
@@ -22,6 +21,7 @@
 #include "Resources/FGItemDescriptor.h"
 #include "Styling/CoreStyle.h"
 #include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Input/SButton.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/SBoxPanel.h"
@@ -67,7 +67,7 @@ void SMISSelectionPanel::Construct(const FArguments& Args)
                     [ SNew(STextBlock).Text(LOCTEXT("SelectionTitle", "Selected Buildings"))
                         .Font(FCoreStyle::GetDefaultFontStyle("Bold", 16)) ]
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 6)
-                    [ SNew(STextBlock).Text(LOCTEXT("SelectionHelp", "Uncheck a type to exclude it from selection"))
+                    [ SNew(STextBlock).Text(LOCTEXT("SelectionHelp", "Choose building types, then click Apply"))
                         .AutoWrapText(true) ]
                     + SVerticalBox::Slot().MaxHeight(350)
                     [
@@ -79,6 +79,12 @@ void SMISSelectionPanel::Construct(const FArguments& Args)
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 6)
                     [ SNew(STextBlock).Text_Lambda([this] { return Owner->GetSelectionStatus(); }).AutoWrapText(true)
                         .Visibility_Lambda([this] { return Owner->GetSelectionStatus().IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible; }) ]
+                    + SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right)
+                    [ SNew(SButton).Text(LOCTEXT("SelectionApply", "Apply"))
+                        .IsEnabled_Lambda([this] {
+                            return Owner->IsSelectionInteractive() && !Owner->IsSelectionBusy() && Owner->HasSelectionEdits();
+                        })
+                        .OnClicked_Lambda([this] { Owner->ApplySelectionEdits(); return FReply::Handled(); }) ]
                 ]
             ]
         ]
@@ -92,6 +98,8 @@ TSharedRef<ITableRow> SMISSelectionPanel::MakeRow(TSharedPtr<FMISSelectionType> 
         SNew(SCheckBox)
         .IsEnabled_Lambda([this] { return Owner->IsSelectionInteractive() && !Owner->IsSelectionBusy(); })
         .IsChecked_Lambda([Item] {
+            if (Item->PendingEnabled.IsSet())
+                return Item->PendingEnabled.GetValue() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked;
             return Item->Selected == 0 ? ECheckBoxState::Unchecked
                 : Item->Excluded > 0 ? ECheckBoxState::Undetermined : ECheckBoxState::Checked;
         })
@@ -285,6 +293,12 @@ void FMISModule::TickSelectionPanel()
     if (!IsDefaultDismantleMode())
     {
         CloseSelectionInteraction();
+        if (!SelectionOperations.IsEmpty())
+        {
+            SelectionOperations.Reset();
+            SelectionMessage = LOCTEXT("SelectionStopped", "Update stopped. Completed changes remain; recheck a type to restore excluded buildings.");
+            bSelectionDirty = true;
+        }
         bSelectionRequested = false;
         if (SelectionPanel.IsValid()) SelectionPanel->SetVisibility(EVisibility::Collapsed);
         ReleaseTemporaryPins(false);
@@ -443,12 +457,7 @@ void FMISModule::ToggleSelectionInteraction()
 void FMISModule::CloseSelectionInteraction()
 {
     if (!bSelectionInteractive) return;
-    if (!SelectionOperations.IsEmpty())
-    {
-        SelectionOperations.Reset();
-        SelectionMessage = LOCTEXT("SelectionStopped", "Update stopped. Completed changes remain; recheck a type to restore excluded buildings.");
-        bSelectionDirty = true;
-    }
+    for (const auto& Row : SelectionTypes) Row->PendingEnabled.Reset();
     bSelectionInteractive = false;
     NextHintUpdate = 0;
     if (auto* PC = Player.Get())
@@ -465,19 +474,37 @@ void FMISModule::CloseSelectionInteraction()
 void FMISModule::SetSelectionTypeEnabled(UClass* Class, bool bEnabled)
 {
     if (!IsDefaultDismantleMode() || !Class || !bSelectionInteractive || IsSelectionBusy()) return;
+    const auto* Row = SelectionTypeLookup.Find(Class);
+    if (!Row) return;
+    if (bEnabled ? (*Row)->Excluded == 0 : (*Row)->Selected == 0) (*Row)->PendingEnabled.Reset();
+    else (*Row)->PendingEnabled = bEnabled;
+    SelectionMessage = FText::GetEmpty();
+}
+
+bool FMISModule::HasSelectionEdits() const
+{
+    return SelectionTypes.ContainsByPredicate([](const auto& Row) { return Row->PendingEnabled.IsSet(); });
+}
+
+void FMISModule::ApplySelectionEdits()
+{
+    if (!IsDefaultDismantleMode() || !bSelectionInteractive || IsSelectionBusy() || !HasSelectionEdits()) return;
     auto* State = ActiveState.Get();
-    bRestoreSelection = bEnabled;
     NextSelectionOperation = SelectionOperationChanged = 0;
-    if (bEnabled)
+    for (AActor* Actor : State->mPendingDismantleActors)
     {
-        for (const auto& Pair : ExcludedSelection)
-            if (Pair.Value.Class.Get() == Class) SelectionOperations.Add(Pair.Value);
+        if (!IsValid(Actor)) continue;
+        const auto* Row = SelectionTypeLookup.Find(Actor->GetClass());
+        if (Row && (*Row)->PendingEnabled.IsSet() && !(*Row)->PendingEnabled.GetValue() && BuildableEligibility.IsActorSelectable(Actor))
+            SelectionOperations.Add({ CaptureSelectionObject(Actor), false });
     }
-    else
+    for (const auto& Pair : ExcludedSelection)
     {
-        for (AActor* Actor : State->GetPendingDismantleActors())
-            if (BuildableEligibility.IsActorSelectable(Actor) && Actor->GetClass() == Class) SelectionOperations.Add(CaptureSelectionObject(Actor));
+        const auto* Row = SelectionTypeLookup.Find(Pair.Value.Class);
+        if (Row && (*Row)->PendingEnabled.IsSet() && (*Row)->PendingEnabled.GetValue())
+            SelectionOperations.Add({ Pair.Value, true });
     }
+    for (const auto& Row : SelectionTypes) Row->PendingEnabled.Reset();
     SelectionMessage = FText::GetEmpty();
 }
 
@@ -487,72 +514,64 @@ void FMISModule::ProcessSelectionOperations()
     auto* State = ActiveState.Get();
     const double Deadline = FPlatformTime::Seconds() + 0.002;
     const int32 Requested = SelectionOperations.Num();
+    bool bCapacityReached = false;
     TGuardValue<bool> MutationGuard(bInsideSelectionMutation, true);
     do
     {
-        const auto Object = SelectionOperations[NextSelectionOperation++];
+        const auto Operation = SelectionOperations[NextSelectionOperation++];
+        const auto& Object = Operation.Object;
         if (!IsSelectionObjectValid(Object)) continue;
         AActor* Actor = Object.Actor.Get();
-        if (bRestoreSelection)
+        AFGBuildable* Buildable = nullptr;
+        if (Operation.bRestore)
         {
-            if (State->GetNumPendingDismantleActors(false) >= State->GetMaxNumPendingDismantleActors() || !HasObjectHeadroom()) break;
+            if (State->GetNumPendingDismantleActors(false) >= State->GetMaxNumPendingDismantleActors() || !HasObjectHeadroom())
+            {
+                bCapacityReached = true;
+                break;
+            }
             const auto Filter = State->GetCurrentDismantleClassFilter();
             if (Filter && !Object.Class->IsChildOf(Filter)) continue;
             if (Object.LightweightIndex != INDEX_NONE)
-            {
-                auto* Subsystem = AFGLightweightBuildableSubsystem::Get(Player->GetWorld());
-                auto* Data = Subsystem ? Subsystem->GetRuntimeDataForBuildableClassAndIndex(Object.Class.Get(), Object.LightweightIndex) : nullptr;
-                if (!Data || !Data->IsValid()) continue;
-                bool bSpawned = false;
-                auto* Temporary = Subsystem->FindOrSpawnBuildableForRuntimeData(Object.Class.Get(), Data, Object.LightweightIndex, bSpawned);
-                Actor = Temporary ? Temporary->Buildable.Get() : nullptr;
-            }
+                Actor = ResolveLightweightBuildable(Object.Class.Get(), Object.LightweightIndex, Object.Transform);
             if (!BuildableEligibility.IsActorSelectable(Actor) || !State->CanDismantleActor(Actor)) continue;
-            auto* Buildable = Cast<AFGBuildable>(Actor);
-            const bool bPin = Buildable && Buildable->GetIsLightweightTemporary() && !Buildable->GetBlockCleanupOfTemporary();
-            if (bPin) Buildable->SetBlockCleanupOfTemporary(true);
-            {
-                TGuardValue<bool> RemoveGuard(State->mShouldRemoveFromMultiSelect, false);
-                State->AddPendingDismantleActor(Actor);
-            }
-            MarkSelectionChanged();
-            if (ActiveState.Get() != State || SelectionOperations.IsEmpty())
-            {
-                if (bPin && IsValid(Buildable)) Buildable->SetBlockCleanupOfTemporary(false);
-                return;
-            }
-            if (State->mPendingDismantleActors.Contains(Actor))
-            {
-                ++SelectionOperationChanged;
-                if (bPin) PinnedTemporaries.AddUnique(Buildable);
-                const auto Key = Object.GetKey();
-                if (const auto* Excluded = ExcludedSelection.Find(Key); Excluded && Excluded->SameObject(Object))
-                    ExcludedSelection.Remove(Key);
-            }
-            else if (bPin) Buildable->SetBlockCleanupOfTemporary(false);
+            Buildable = Cast<AFGBuildable>(Actor);
         }
-        else if (IsValid(Actor) && State->mPendingDismantleActors.Contains(Actor) &&
-            CaptureSelectionObject(Actor).SameObject(Object))
+        else if (!IsValid(Actor) || !State->mPendingDismantleActors.Contains(Actor) ||
+            !CaptureSelectionObject(Actor).SameObject(Object)) continue;
+
+        const bool bPin = Buildable && Buildable->GetIsLightweightTemporary() && !Buildable->GetBlockCleanupOfTemporary();
+        if (bPin) Buildable->SetBlockCleanupOfTemporary(true);
         {
-            TGuardValue<bool> RemoveGuard(State->mShouldRemoveFromMultiSelect, true);
+            TGuardValue<bool> RemoveGuard(State->mShouldRemoveFromMultiSelect, !Operation.bRestore);
             State->AddPendingDismantleActor(Actor);
-            MarkSelectionChanged();
-            if (ActiveState.Get() != State || SelectionOperations.IsEmpty()) return;
-            if (!State->mPendingDismantleActors.Contains(Actor))
-            {
-                ++SelectionOperationChanged;
-                ExcludedSelection.Add(Object.GetKey(), Object);
-            }
         }
+        MarkSelectionChanged();
+        if (ActiveState.Get() != State || SelectionOperations.IsEmpty())
+        {
+            if (bPin && IsValid(Buildable)) Buildable->SetBlockCleanupOfTemporary(false);
+            return;
+        }
+        if (State->mPendingDismantleActors.Contains(Actor) != Operation.bRestore)
+        {
+            if (bPin) Buildable->SetBlockCleanupOfTemporary(false);
+            continue;
+        }
+        ++SelectionOperationChanged;
+        const auto Key = Object.GetKey();
+        if (Operation.bRestore)
+        {
+            if (bPin) PinnedTemporaries.AddUnique(Buildable);
+            if (const auto* Excluded = ExcludedSelection.Find(Key); Excluded && Excluded->SameObject(Object))
+                ExcludedSelection.Remove(Key);
+        }
+        else ExcludedSelection.Add(Key, Object);
     } while (NextSelectionOperation < Requested && FPlatformTime::Seconds() < Deadline);
     bSelectionDirty = true;
-    if (NextSelectionOperation >= Requested || (bRestoreSelection &&
-        (State->GetNumPendingDismantleActors(false) >= State->GetMaxNumPendingDismantleActors() || !HasObjectHeadroom())))
+    if (NextSelectionOperation >= Requested || bCapacityReached)
     {
         SelectionMessage = SelectionOperationChanged == Requested ? FText::GetEmpty()
-            : bRestoreSelection
-                ? LOCTEXT("SelectionRestoreIncomplete", "Some buildings could not be restored. Check the dismantle limit and filter.")
-                : LOCTEXT("SelectionExcludeIncomplete", "Some buildings could not be removed from the selection.");
+            : LOCTEXT("SelectionApplyIncomplete", "Some buildings could not be updated. Check the dismantle limit and filter.");
         SelectionOperations.Reset();
     }
 }
@@ -567,6 +586,7 @@ int32 FMISModule::GetPanelSelectedCount() const
 FText FMISModule::GetSelectionStatus() const
 {
     if (IsSelectionBusy()) return LOCTEXT("SelectionUpdating", "Updating selection…");
+    if (HasSelectionEdits()) return LOCTEXT("SelectionPending", "Changes pending. Click Apply to update the selection.");
     return SelectionMessage;
 }
 

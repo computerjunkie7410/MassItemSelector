@@ -9,6 +9,7 @@
 #include "MISSelectionBudget.h"
 #include "MISBuildableEligibility.h"
 #include "FGRecipe.h"
+#include "FGSchematicManager.h"
 #include "Buildables/FGBuildable.h"
 #include "Buildables/FGBuildableWire.h"
 #include "Camera/PlayerCameraManager.h"
@@ -31,6 +32,7 @@
 #include "HAL/PlatformTime.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "InputCoreTypes.h"
+#include "Misc/ScopeExit.h"
 #include "TimerManager.h"
 #include "Patching/NativeHookManager.h"
 #include "UObject/UObjectArray.h"
@@ -93,6 +95,24 @@ void FMISModule::StartupModule()
             if (IsApplying())
                 FinishApply(LOCTEXT("NativeSelectionCleared", "Selection stopped: native dismantle selection was cleared."));
         });
+    RecipeFixupHook = SUBSCRIBE_METHOD(AFGSchematicManager::FixupSave_FindBuiltByRecipe,
+        [this](auto& Scope, AFGSchematicManager*, AActor* Actor) {
+            if (const auto Recipe = GetLightweightSpawnRecipe(Actor)) Scope.Override(Recipe);
+        });
+    LightweightSpawnHook = SUBSCRIBE_METHOD(AFGLightweightBuildableSubsystem::FindOrSpawnBuildableForRuntimeData,
+        [this](auto& Scope, AFGLightweightBuildableSubsystem* Subsystem, TSubclassOf<AFGBuildable> Class,
+            FRuntimeBuildableInstanceData* Data, int32 Index, bool& bSpawned) {
+            // BeginPlay can request recipe recovery before the pool assigns the instance recipe.
+            TGuardValue<TSubclassOf<AFGBuildable>> ClassGuard(LightweightSpawnClass, Class);
+            TGuardValue<TSubclassOf<UFGRecipe>> RecipeGuard(LightweightSpawnRecipe,
+                Data && IsValid(Data->BuiltWithRecipe.Get()) ? Data->BuiltWithRecipe : nullptr);
+            TGuardValue<TWeakObjectPtr<UWorld>> WorldGuard(LightweightSpawnWorld, Subsystem->GetWorld());
+            Scope(Subsystem, Class, Data, Index, bSpawned);
+        });
+    RefundHook = SUBSCRIBE_METHOD(UFGBuildGunStateDismantle::UpdatePeekDismantleRefunds,
+        [this](auto& Scope, UFGBuildGunStateDismantle* State, bool bNoBuildCost) {
+            if (DeferRefundUpdate(State, bNoBuildCost)) Scope.Cancel();
+        });
     UE_LOG(LogMIS, Log, TEXT("Item Selector runtime hooks installed; hold the configured lasso key (Left Alt by default) in Default dismantle mode."));
 #else
     UE_LOG(LogMIS, Log, TEXT("Item Selector editor module loaded; runtime hooks require the packaged game."));
@@ -109,6 +129,9 @@ void FMISModule::ShutdownModule()
     if (EndHook.IsValid()) UNSUBSCRIBE_METHOD(UFGBuildGunStateDismantle::EndState_Implementation, EndHook);
     if (AimHook.IsValid()) UNSUBSCRIBE_METHOD(UFGBuildGunStateDismantle::SetAimedAtActor, AimHook);
     if (ClearHook.IsValid()) UNSUBSCRIBE_METHOD(UFGBuildGunStateDismantle::ClearPendingSelectedActors, ClearHook);
+    if (RecipeFixupHook.IsValid()) UNSUBSCRIBE_METHOD(AFGSchematicManager::FixupSave_FindBuiltByRecipe, RecipeFixupHook);
+    if (LightweightSpawnHook.IsValid()) UNSUBSCRIBE_METHOD(AFGLightweightBuildableSubsystem::FindOrSpawnBuildableForRuntimeData, LightweightSpawnHook);
+    if (RefundHook.IsValid()) UNSUBSCRIBE_METHOD(UFGBuildGunStateDismantle::UpdatePeekDismantleRefunds, RefundHook);
 #endif
 }
 
@@ -119,6 +142,8 @@ void FMISModule::TickState(UFGBuildGunStateDismantle* State)
     AFGCharacterPlayer* Character = Gun ? Gun->GetInstigatorCharacter() : nullptr;
     APlayerController* PC = Character ? Cast<APlayerController>(Character->GetController()) : nullptr;
     if (!PC || !PC->IsLocalController() || !PC->GetLocalPlayer()) return;
+    ON_SCOPE_EXIT { if (!bDeferringRefundUpdates) FlushRefundUpdate(); };
+    TGuardValue<bool> RefundGuard(bDeferringRefundUpdates, true);
     if (ActiveState.Get() != State)
     {
         if (ActiveState.IsValid()) EndState(ActiveState.Get());
@@ -241,6 +266,8 @@ void FMISModule::EndState(UFGBuildGunStateDismantle* State)
     RemoveFeedback();
     ReleaseTemporaryPins(true);
     ActiveState.Reset();
+    bRefundUpdatePending = false;
+    NextRefundUpdate = 0;
     Player.Reset();
     ActiveWorld.Reset();
     SelectedActorLookup.Empty();
@@ -759,13 +786,7 @@ void FMISModule::ProcessBatch()
         AFGBuildable* Actor = Candidate.Actor.Get();
         if (Candidate.LightweightIndex != INDEX_NONE)
         {
-            auto* Subsystem = AFGLightweightBuildableSubsystem::Get(PC->GetWorld());
-            UClass* Class = Candidate.LightweightClass.Get();
-            auto* Data = Subsystem && Class ? Subsystem->GetRuntimeDataForBuildableClassAndIndex(Class, Candidate.LightweightIndex) : nullptr;
-            if (!Data || !Data->IsValid() || !Data->Transform.Equals(Candidate.Transform)) continue;
-            bool bSpawned = false;
-            auto* Temporary = Subsystem->FindOrSpawnBuildableForRuntimeData(Class, Data, Candidate.LightweightIndex, bSpawned);
-            Actor = Temporary ? Temporary->Buildable.Get() : nullptr;
+            Actor = ResolveLightweightBuildable(Candidate.LightweightClass.Get(), Candidate.LightweightIndex, Candidate.Transform);
         }
         if (!IsApplying()) return;
         if (IsValid(Actor)) AddActor(Actor);
@@ -835,6 +856,48 @@ void FMISModule::ShowFeedback(const FText& Message, bool bProgress)
     FeedbackViewport = Viewport;
     FeedbackExpires = bProgress ? 0 : FPlatformTime::Seconds() + 6;
     Viewport->AddViewportWidgetContent(Feedback.ToSharedRef(), 101);
+}
+
+AFGBuildable* FMISModule::ResolveLightweightBuildable(UClass* Class, int32 Index, const FTransform& Transform)
+{
+    auto* PC = Player.Get();
+    auto* Subsystem = PC ? AFGLightweightBuildableSubsystem::Get(PC->GetWorld()) : nullptr;
+    auto* Data = Subsystem && Class ? Subsystem->GetRuntimeDataForBuildableClassAndIndex(Class, Index) : nullptr;
+    if (!Data || !Data->IsValid() || !Data->Transform.Equals(Transform) || !IsValid(Data->BuiltWithRecipe.Get())) return nullptr;
+
+    bool bSpawned = false;
+    auto* Temporary = Subsystem->FindOrSpawnBuildableForRuntimeData(Class, Data, Index, bSpawned);
+    return Temporary ? Temporary->Buildable.Get() : nullptr;
+}
+
+TSubclassOf<UFGRecipe> FMISModule::GetLightweightSpawnRecipe(const AActor* Actor) const
+{
+    return Actor && Actor->GetClass() == LightweightSpawnClass && Actor->GetWorld() == LightweightSpawnWorld.Get()
+        ? LightweightSpawnRecipe : nullptr;
+}
+
+bool FMISModule::DeferRefundUpdate(UFGBuildGunStateDismantle* State, bool bNoBuildCost)
+{
+    if (bFlushingRefundUpdate || ActiveState.Get() != State || (!bDeferringRefundUpdates && !IsSelectionBusy())) return false;
+    bRefundUpdatePending = true;
+    bRefundNoBuildCost = bNoBuildCost;
+    return true;
+}
+
+void FMISModule::FlushRefundUpdate()
+{
+    if (!bRefundUpdatePending) return;
+    const double Now = FPlatformTime::Seconds();
+    if (IsSelectionBusy() && Now < NextRefundUpdate) return;
+    bRefundUpdatePending = false;
+    NextRefundUpdate = Now + 0.25;
+    auto* State = ActiveState.Get();
+    auto* World = ActiveWorld.Get();
+    if (State && World && !World->bIsTearingDown)
+    {
+        TGuardValue<bool> FlushGuard(bFlushingRefundUpdate, true);
+        State->UpdatePeekDismantleRefunds(bRefundNoBuildCost);
+    }
 }
 
 void FMISModule::AddActor(AFGBuildable* Actor)

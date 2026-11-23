@@ -18,12 +18,14 @@
 #include "GameFramework/PlayerController.h"
 #include "FGGameFeatureData.h"
 #include "Engine/AssetManagerTypes.h"
+#include "Engine/AssetManager.h"
 #include "Configuration/Properties/ConfigPropertySection.h"
 #include "MISOverlay.h"
 #include "InputCoreTypes.h"
 #include "Framework/Application/IInputProcessor.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Equipment/FGBuildGunDismantle.h"
+#include "FGRecipe.h"
 #include "FGDismantleModeDescriptor.h"
 #include "UObject/UnrealType.h"
 #include "MISSelectionNames.h"
@@ -32,6 +34,7 @@
 #include "Misc/AutomationTest.h"
 #include "Misc/ScopeExit.h"
 #include "HAL/IConsoleManager.h"
+#include "Internationalization/TextLocalizationManager.h"
 
 namespace
 {
@@ -372,6 +375,12 @@ bool FMISLassoBindingsTest::RunTest(const FString&)
     TestEqual(TEXT("The context follows native dismantling"), Context->mParentContext.ToSoftObjectPath().GetAssetName(), FString(TEXT("MC_BuildGunDismantle")));
     auto* Feature = LoadObject<UFGGameFeatureData>(nullptr, TEXT("/MassItemSelector/MassItemSelector.MassItemSelector"));
     if (!TestNotNull(TEXT("Game Feature data is packaged"), Feature)) return false;
+    TestEqual(TEXT("MIS uses the primary asset type registered by Unreal Game Features"),
+        Feature->GetPrimaryAssetId(), FPrimaryAssetId(TEXT("GameFeatureData"), Feature->GetFName()));
+    TestFalse(TEXT("The native class default object is not an asset"),
+        Feature->GetClass()->GetDefaultObject()->GetPrimaryAssetId().IsValid());
+    TestEqual(TEXT("Game Feature preload bundles can resolve the registered feature asset"),
+        UAssetManager::Get().GetPrimaryAssetPath(Feature->GetPrimaryAssetId()), FSoftObjectPath(Feature));
     const bool bScanned = Feature->GetPrimaryAssetTypesToScan().ContainsByPredicate([](const FPrimaryAssetTypeInfo& Info) {
         return Info.PrimaryAssetType == FPrimaryAssetType(TEXT("FGChildInputMappingContext")) &&
             Info.GetDirectories().ContainsByPredicate([](const FDirectoryPath& Directory) {
@@ -830,9 +839,20 @@ bool FMISLassoInputTest::RunTest(const FString&)
     Module.Player->bShowMouseCursor = true;
     const FPointerEvent OutsideClick(0, FVector2D(10000, 10000), FVector2D(10000, 10000),
         TSet<FKey>{ EKeys::LeftMouseButton }, EKeys::LeftMouseButton, 0.f, FModifierKeysState());
+    Module.SelectionOperations.SetNum(2000);
+    Module.NextSelectionOperation = 500;
+    Module.SelectionOperationChanged = 450;
+    Module.Player->SetIgnoreLookInput(true);
+    Module.Player->SetIgnoreMoveInput(true);
     TestTrue(TEXT("An outside click is consumed when closing the filter interaction"),
         Input->HandleMouseButtonDownEvent(Slate, OutsideClick));
     TestFalse(TEXT("Clicking outside returns to normal dismantle interaction"), Module.bSelectionInteractive);
+    TestFalse(TEXT("Closing ADF releases camera input during a large update"), Module.Player->IsLookInputIgnored());
+    TestFalse(TEXT("Closing ADF releases movement input during a large update"), Module.Player->IsMoveInputIgnored());
+    TestEqual(TEXT("Closing ADF preserves queued selection work"), Module.SelectionOperations.Num(), 2000);
+    TestEqual(TEXT("Closing ADF preserves the next operation"), Module.NextSelectionOperation, 500);
+    TestEqual(TEXT("Closing ADF preserves completed progress"), Module.SelectionOperationChanged, 450);
+    TestTrue(TEXT("The update remains busy after closing ADF"), Module.IsSelectionBusy());
     TestFalse(TEXT("An outside click does not queue reopening the filter"), Module.bSelectionRequested);
     TestFalse(TEXT("An outside click does not confirm a lasso selection"), Module.bApplyLassoRequested);
     Module.bSelectionInteractive = true;
@@ -842,6 +862,9 @@ bool FMISLassoInputTest::RunTest(const FString&)
         Input->HandleKeyDownEvent(Slate, KeyPress(EKeys::Escape)));
     TestFalse(TEXT("Escape returns to normal dismantle interaction"), Module.bSelectionInteractive);
     TestFalse(TEXT("Escape restores the game cursor state"), Module.Player->bShowMouseCursor);
+    TestEqual(TEXT("Escape preserves background reselection work"), Module.SelectionOperations.Num(), 2000);
+    TestTrue(TEXT("Closing ADF does not report a stopped update"), Module.SelectionMessage.IsEmpty());
+    Module.SelectionOperations.Reset();
     TestFalse(TEXT("Closing ADF with Escape keeps dismantle mode active"), Module.bExitDismantleRequested);
     Module.SelectionPanel.Reset();
     Module.Player.Reset();
@@ -920,6 +943,165 @@ bool FMISScanBudgetTest::RunTest(const FString&)
     TestEqual(TEXT("Cancelling resets the lightweight scan"), Module.NextLightweightClass, 0);
     Module.Player.Reset();
     World->DestroyWorld(false);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMISSelectionApplyTest, "MassItemSelector.Selection.Apply",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMISSelectionApplyTest::RunTest(const FString&)
+{
+    FMISModule Module;
+    auto* State = NewObject<UFGBuildGunStateDismantle>();
+    auto* DefaultMode = FindFProperty<FClassProperty>(State->GetClass(), TEXT("mDefaultDismantleMode"));
+    if (!TestNotNull(TEXT("The native Default mode property exists"), DefaultMode)) return false;
+    DefaultMode->SetObjectPropertyValue_InContainer(State, UFGDismantleModeDescriptor::StaticClass());
+    Module.ActiveState = State;
+    Module.LastDismantleMode = UFGDismantleModeDescriptor::StaticClass();
+    Module.bSelectionInteractive = true;
+
+    auto* Selected = GetMutableDefault<AFGBuildable>();
+    auto* Excluded = GetMutableDefault<AFGBuildableWire>();
+    auto* Property = FindFProperty<FArrayProperty>(State->GetClass(), TEXT("mPendingDismantleActors"));
+    if (!TestNotNull(TEXT("Native selection array is available"), Property)) return false;
+    FScriptArrayHelper Pending(Property, Property->ContainerPtrToValuePtr<void>(State));
+    CastFieldChecked<FObjectPropertyBase>(Property->Inner)->SetObjectPropertyValue(Pending.GetRawPtr(Pending.AddValue()), Selected);
+    auto AddRow = [&](UClass* Class, int32 SelectedCount, int32 ExcludedCount) {
+        auto Row = MakeShared<FMISSelectionType>();
+        Row->Class = Class;
+        Row->Selected = SelectedCount;
+        Row->Excluded = ExcludedCount;
+        Module.SelectionTypes.Add(Row);
+        Module.SelectionTypeLookup.Add(Class, Row);
+        return Row;
+    };
+    auto SelectedRow = AddRow(Selected->GetClass(), 2000, 0);
+    auto ExcludedRow = AddRow(Excluded->GetClass(), 0, 1);
+    const auto ExcludedObject = Module.CaptureSelectionObject(Excluded);
+    Module.ExcludedSelection.Add(ExcludedObject.GetKey(), ExcludedObject);
+
+    Module.SetSelectionTypeEnabled(Selected->GetClass(), false);
+    Module.SetSelectionTypeEnabled(Excluded->GetClass(), true);
+    TestTrue(TEXT("The removal choice is staged on its row"), SelectedRow->PendingEnabled.IsSet() && !SelectedRow->PendingEnabled.GetValue());
+    TestTrue(TEXT("The restoration choice is staged independently"), ExcludedRow->PendingEnabled.IsSet() && ExcludedRow->PendingEnabled.GetValue());
+    TestTrue(TEXT("Several building types can be edited before Apply"), Module.HasSelectionEdits());
+    TestTrue(TEXT("Checkbox edits do not start native selection work"), Module.SelectionOperations.IsEmpty());
+    TestFalse(TEXT("Staged edits do not make the selection busy"), Module.IsSelectionBusy());
+    TestEqual(TEXT("Staged edits leave native selection unchanged"), Pending.Num(), 1);
+    Module.SetSelectionTypeEnabled(Selected->GetClass(), true);
+    Module.SetSelectionTypeEnabled(Excluded->GetClass(), false);
+    TestFalse(TEXT("Reversing checkbox edits removes unnecessary work"), Module.HasSelectionEdits());
+    Module.SetSelectionTypeEnabled(Selected->GetClass(), false);
+    Module.SetSelectionTypeEnabled(Excluded->GetClass(), true);
+    Module.CloseSelectionInteraction();
+    TestFalse(TEXT("Closing ADF discards unapplied edits"), Module.HasSelectionEdits());
+    TestTrue(TEXT("Discarded edits leave no queued work"), Module.SelectionOperations.IsEmpty());
+    TestEqual(TEXT("Discarding edits preserves excluded buildings"), Module.ExcludedSelection.Num(), 1);
+
+    Module.bSelectionInteractive = true;
+    Module.SetSelectionTypeEnabled(Selected->GetClass(), false);
+    Module.SetSelectionTypeEnabled(Excluded->GetClass(), true);
+    Module.ApplySelectionEdits();
+    if (!TestEqual(TEXT("Apply queues restoration while skipping ineligible SDK placeholder actors"), Module.SelectionOperations.Num(), 1)) return false;
+    TestTrue(TEXT("The queued operation restores selection"), Module.SelectionOperations[0].bRestore);
+    TestTrue(TEXT("The restoration targets the excluded building"), Module.SelectionOperations[0].Object.Actor.Get() == Excluded);
+    TestFalse(TEXT("Apply consumes the staged edits"), Module.HasSelectionEdits());
+    Module.ApplySelectionEdits();
+    TestEqual(TEXT("Repeated Apply cannot duplicate in-flight work"), Module.SelectionOperations.Num(), 1);
+    Module.CloseSelectionInteraction();
+    TestEqual(TEXT("Closing ADF after Apply preserves background work"), Module.SelectionOperations.Num(), 1);
+    Module.ResetSelectionPanel();
+    TestTrue(TEXT("Ending the selection cancels outstanding applied work"), Module.SelectionOperations.IsEmpty());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMISLocalizationTest, "MassItemSelector.Selection.LocalizationResources",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMISLocalizationTest::RunTest(const FString&)
+{
+    FString Resource;
+    TestTrue(TEXT("MIS localization is loaded through the normal plugin loading policy"),
+        FTextLocalizationManager::Get().GetLocResID(TEXT("ItemSelector"), TEXT("ApplyLasso"), Resource));
+    TestTrue(TEXT("The lasso text comes from MIS's compiled localization resource"),
+        Resource.Contains(TEXT("MassItemSelector")) && Resource.EndsWith(TEXT(".locres")));
+    TestTrue(TEXT("The Apply button has a compiled localization entry"),
+        FTextLocalizationManager::Get().GetLocResID(TEXT("ItemSelector"), TEXT("SelectionApply"), Resource));
+    TestTrue(TEXT("The pending-edits message has a compiled localization entry"),
+        FTextLocalizationManager::Get().GetLocResID(TEXT("ItemSelector"), TEXT("SelectionPending"), Resource));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMISCrashRegressionTest, "MassItemSelector.Selection.CrashRegression",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMISCrashRegressionTest::RunTest(const FString&)
+{
+    FMISModule Module;
+    UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+    ON_SCOPE_EXIT { World->DestroyWorld(false); };
+    Module.ActiveWorld = World;
+    auto* BuildableClass = LoadClass<AFGBuildable>(nullptr,
+        TEXT("/Game/FactoryGame/Buildable/Building/Foundation/Build_Foundation_8x2_01.Build_Foundation_8x2_01_C"));
+    if (!TestNotNull(TEXT("A concrete buildable class is available"), BuildableClass)) return false;
+    auto* Buildable = World->SpawnActor<AFGBuildable>(BuildableClass);
+    if (!TestNotNull(TEXT("A temporary-spawn test actor can be created"), Buildable)) return false;
+    TestFalse(TEXT("Ordinary recipe recovery is unchanged"), bool(Module.GetLightweightSpawnRecipe(Buildable)));
+    {
+        TGuardValue<TSubclassOf<AFGBuildable>> ClassGuard(Module.LightweightSpawnClass, BuildableClass);
+        TGuardValue<TSubclassOf<UFGRecipe>> RecipeGuard(Module.LightweightSpawnRecipe, UFGRecipe::StaticClass());
+        TGuardValue<TWeakObjectPtr<UWorld>> WorldGuard(Module.LightweightSpawnWorld, World);
+        TestTrue(TEXT("A matching pool spawn uses the recorded instance recipe"),
+            Module.GetLightweightSpawnRecipe(Buildable) == UFGRecipe::StaticClass());
+        TestFalse(TEXT("Unrelated actors retain native recipe recovery"),
+            bool(Module.GetLightweightSpawnRecipe(World->SpawnActor<AActor>())));
+        Module.ActiveWorld.Reset();
+        TestTrue(TEXT("Native spawns remain protected without an active MIS world or selection"),
+            Module.GetLightweightSpawnRecipe(Buildable) == UFGRecipe::StaticClass());
+        Module.LightweightSpawnWorld.Reset();
+        TestFalse(TEXT("Recipe overrides cannot cross worlds"), bool(Module.GetLightweightSpawnRecipe(Buildable)));
+        Module.LightweightSpawnWorld = World;
+        {
+            TGuardValue<TSubclassOf<UFGRecipe>> NestedRecipeGuard(Module.LightweightSpawnRecipe, nullptr);
+            TestFalse(TEXT("Nested spawns without a recipe cannot inherit the outer recipe"),
+                bool(Module.GetLightweightSpawnRecipe(Buildable)));
+        }
+        TestTrue(TEXT("Finishing a nested spawn restores the outer recipe"),
+            Module.GetLightweightSpawnRecipe(Buildable) == UFGRecipe::StaticClass());
+        Module.ActiveWorld = World;
+    }
+    TestFalse(TEXT("The recipe override ends with the synchronous spawn"), bool(Module.GetLightweightSpawnRecipe(Buildable)));
+
+    auto* State = NewObject<UFGBuildGunStateDismantle>();
+    auto* OtherState = NewObject<UFGBuildGunStateDismantle>();
+    Module.ActiveState = State;
+    TestFalse(TEXT("Native updates outside MIS work are unchanged"), Module.DeferRefundUpdate(State, false));
+    {
+        TGuardValue<bool> RefundGuard(Module.bDeferringRefundUpdates, true);
+        TestFalse(TEXT("Other players' refund updates are unchanged"), Module.DeferRefundUpdate(OtherState, false));
+        for (int32 Index = 0; Index < 10000; ++Index)
+            Module.DeferRefundUpdate(State, Index == 9999);
+        TestTrue(TEXT("Building additions coalesce into one pending refund update"), Module.bRefundUpdatePending);
+        TestTrue(TEXT("The final request preserves the no-build-cost setting"), Module.bRefundNoBuildCost);
+    }
+    Module.FlushRefundUpdate();
+    TestFalse(TEXT("Flushing consumes the pending refund update"), Module.bRefundUpdatePending);
+    Module.FlushRefundUpdate();
+    TestFalse(TEXT("An unchanged batch has no refund work to repeat"), Module.bRefundUpdatePending);
+    Module.bScanning = Module.bApplying = true;
+    Module.NextRefundUpdate = TNumericLimits<double>::Max();
+    TestTrue(TEXT("Native aim updates between batches are also deferred"), Module.DeferRefundUpdate(State, false));
+    Module.FlushRefundUpdate();
+    TestTrue(TEXT("Busy selections throttle refund widget rebuilds"), Module.bRefundUpdatePending);
+    Module.bScanning = Module.bApplying = false;
+    Module.FlushRefundUpdate();
+    TestFalse(TEXT("Finishing a selection flushes immediately despite the throttle"), Module.bRefundUpdatePending);
+    Module.bDeferringRefundUpdates = true;
+    Module.DeferRefundUpdate(State, false);
+    Module.bDeferringRefundUpdates = false;
+    Module.ActiveState.Reset();
+    Module.FlushRefundUpdate();
+    TestFalse(TEXT("An ended state drops pending refund work"), Module.bRefundUpdatePending);
     return true;
 }
 
