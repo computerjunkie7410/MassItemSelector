@@ -946,6 +946,65 @@ bool FMISScanBudgetTest::RunTest(const FString&)
     return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMISLowRiskPerformanceTest, "MassItemSelector.Selection.LowRiskPerformance",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMISLowRiskPerformanceTest::RunTest(const FString&)
+{
+    auto* Distance = IConsoleManager::Get().FindConsoleVariable(TEXT("ItemSelector.MaxDistanceMeters"));
+    if (!TestNotNull(TEXT("The distance setting is registered"), Distance)) return false;
+    const float OriginalDistance = Distance->GetFloat();
+    ON_SCOPE_EXIT { Distance->Set(OriginalDistance, ECVF_SetByConsole); };
+    FMISModule Module;
+    Distance->Set(100.f, ECVF_SetByConsole);
+    Module.bScanning = true;
+    Module.Candidates.SetNum(30);
+    Module.NextCandidate = 17;
+    Module.SetFarDistance(100.f);
+    TestTrue(TEXT("An unchanged distance preserves an active preview scan"), Module.bScanning);
+    TestEqual(TEXT("An unchanged distance preserves scan progress"), Module.NextCandidate, 17);
+    TestEqual(TEXT("An unchanged distance preserves gathered candidates"), Module.Candidates.Num(), 30);
+    TestTrue(TEXT("An unchanged manual edit still overrides automatic native range tracking"), Module.bDistanceWasEdited);
+    Module.CancelScan();
+    Module.bRefreshPreview = true;
+    Module.RefreshPreviewAt = 123.0;
+    Distance->Set(500.f, ECVF_SetByConsole);
+    Module.SetFarDistance(550.f);
+    TestEqual(TEXT("Scrolling past the maximum does not postpone a pending refresh"), Module.RefreshPreviewAt, 123.0);
+    TestTrue(TEXT("Scrolling past the maximum keeps a pending refresh queued"), Module.bRefreshPreview);
+    Distance->Set(5.f, ECVF_SetByConsole);
+    Module.SetFarDistance(-10.f);
+    TestEqual(TEXT("Scrolling past the minimum does not postpone a pending refresh"), Module.RefreshPreviewAt, 123.0);
+    Distance->Set(600.f, ECVF_SetByConsole);
+    Module.SetFarDistance(500.f);
+    TestEqual(TEXT("Manual edits still normalize out-of-range console values"), Distance->GetFloat(), 500.f);
+    TestEqual(TEXT("Normalizing an unchanged effective distance does not rescan"), Module.RefreshPreviewAt, 123.0);
+    Module.bRefreshPreview = false;
+    Module.bScanning = true;
+    Module.NextCandidate = 17;
+    Module.SetFarDistance(400.f);
+    TestFalse(TEXT("A changed distance still cancels the old scan"), Module.bScanning);
+    TestEqual(TEXT("A changed distance resets scan progress"), Module.NextCandidate, 0);
+    TestEqual(TEXT("A changed distance updates the setting"), Distance->GetFloat(), 400.f);
+
+    UWorld* World = UWorld::CreateWorld(EWorldType::Game, false);
+    ON_SCOPE_EXIT { Module.Player.Reset(); World->DestroyWorld(false); };
+    Module.Player = World->SpawnActor<APlayerController>();
+    Module.NextHintScan = TNumericLimits<double>::Max();
+    Module.UpdateDismantleHints();
+    TestTrue(TEXT("The test has no native hint widget target"), Module.DismantleHintTargets.IsEmpty());
+    TestEqual(TEXT("A missing hint widget still honors the scan deadline"), Module.NextHintScan, TNumericLimits<double>::Max());
+    Module.RemoveDismantleHints();
+    TestEqual(TEXT("HUD reset makes discovery immediately eligible"), Module.NextHintScan, 0.0);
+    Module.UpdateDismantleHints();
+    const double NextScan = Module.NextHintScan;
+    TestTrue(TEXT("Discovery schedules its next attempt when no widget exists"), NextScan > 0.0 && NextScan < TNumericLimits<double>::Max());
+    Module.NextHintUpdate = 0;
+    Module.UpdateDismantleHints();
+    TestEqual(TEXT("Repeated empty-widget updates do not repeat discovery early"), Module.NextHintScan, NextScan);
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMISSelectionApplyTest, "MassItemSelector.Selection.Apply",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
@@ -1002,6 +1061,7 @@ bool FMISSelectionApplyTest::RunTest(const FString&)
     Module.SetSelectionTypeEnabled(Selected->GetClass(), false);
     Module.SetSelectionTypeEnabled(Excluded->GetClass(), true);
     Module.ApplySelectionEdits();
+    TestTrue(TEXT("Apply reserves capacity from all staged row counts"), Module.SelectionOperations.Max() >= 2001);
     if (!TestEqual(TEXT("Apply queues restoration while skipping ineligible SDK placeholder actors"), Module.SelectionOperations.Num(), 1)) return false;
     TestTrue(TEXT("The queued operation restores selection"), Module.SelectionOperations[0].bRestore);
     TestTrue(TEXT("The restoration targets the excluded building"), Module.SelectionOperations[0].Object.Actor.Get() == Excluded);
@@ -1075,14 +1135,17 @@ bool FMISCrashRegressionTest::RunTest(const FString&)
     auto* State = NewObject<UFGBuildGunStateDismantle>();
     auto* OtherState = NewObject<UFGBuildGunStateDismantle>();
     Module.ActiveState = State;
-    TestFalse(TEXT("Native updates outside MIS work are unchanged"), Module.DeferRefundUpdate(State, false));
+    TestTrue(TEXT("Native refund previews are deferred even when MIS selection work is idle"), Module.DeferRefundUpdate(State, false));
+    TestFalse(TEXT("Other players' refund updates are unchanged"), Module.DeferRefundUpdate(OtherState, false));
+    for (int32 Index = 0; Index < 10000; ++Index)
+        Module.DeferRefundUpdate(State, Index == 9999);
+    TestTrue(TEXT("Native dismantle removal callbacks coalesce into one pending preview update"), Module.bRefundUpdatePending);
+    TestTrue(TEXT("The final request preserves the no-build-cost setting"), Module.bRefundNoBuildCost);
+    Module.ResetSelectionPanel();
+    TestTrue(TEXT("Clearing the selection after dismantling preserves the final preview refresh"), Module.bRefundUpdatePending);
     {
-        TGuardValue<bool> RefundGuard(Module.bDeferringRefundUpdates, true);
-        TestFalse(TEXT("Other players' refund updates are unchanged"), Module.DeferRefundUpdate(OtherState, false));
-        for (int32 Index = 0; Index < 10000; ++Index)
-            Module.DeferRefundUpdate(State, Index == 9999);
-        TestTrue(TEXT("Building additions coalesce into one pending refund update"), Module.bRefundUpdatePending);
-        TestTrue(TEXT("The final request preserves the no-build-cost setting"), Module.bRefundNoBuildCost);
+        TGuardValue<bool> FlushGuard(Module.bFlushingRefundUpdate, true);
+        TestFalse(TEXT("The final native preview refresh passes through without being deferred again"), Module.DeferRefundUpdate(State, true));
     }
     Module.FlushRefundUpdate();
     TestFalse(TEXT("Flushing consumes the pending refund update"), Module.bRefundUpdatePending);
@@ -1096,9 +1159,7 @@ bool FMISCrashRegressionTest::RunTest(const FString&)
     Module.bScanning = Module.bApplying = false;
     Module.FlushRefundUpdate();
     TestFalse(TEXT("Finishing a selection flushes immediately despite the throttle"), Module.bRefundUpdatePending);
-    Module.bDeferringRefundUpdates = true;
     Module.DeferRefundUpdate(State, false);
-    Module.bDeferringRefundUpdates = false;
     Module.ActiveState.Reset();
     Module.FlushRefundUpdate();
     TestFalse(TEXT("An ended state drops pending refund work"), Module.bRefundUpdatePending);

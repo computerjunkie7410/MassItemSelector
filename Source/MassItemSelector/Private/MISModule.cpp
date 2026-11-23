@@ -142,8 +142,7 @@ void FMISModule::TickState(UFGBuildGunStateDismantle* State)
     AFGCharacterPlayer* Character = Gun ? Gun->GetInstigatorCharacter() : nullptr;
     APlayerController* PC = Character ? Cast<APlayerController>(Character->GetController()) : nullptr;
     if (!PC || !PC->IsLocalController() || !PC->GetLocalPlayer()) return;
-    ON_SCOPE_EXIT { if (!bDeferringRefundUpdates) FlushRefundUpdate(); };
-    TGuardValue<bool> RefundGuard(bDeferringRefundUpdates, true);
+    ON_SCOPE_EXIT { FlushRefundUpdate(); };
     if (ActiveState.Get() != State)
     {
         if (ActiveState.IsValid()) EndState(ActiveState.Get());
@@ -410,7 +409,7 @@ void FMISModule::UpdateDismantleHints()
             ? EMISDismantleHints::Selection : EMISDismantleHints::Default;
     for (auto& Pair : DismantleHintTargets)
         UMISHUDHooks::UpdateDismantleHints(Pair.Key.Get(), Mode, Pair.Value, PC, InputBindings);
-    if (!DismantleHintTargets.IsEmpty() && Now < NextHintScan) return;
+    if (Now < NextHintScan) return;
     NextHintScan = Now + 2.0;
     for (TObjectIterator<UUserWidget> It; It; ++It)
     {
@@ -878,7 +877,7 @@ TSubclassOf<UFGRecipe> FMISModule::GetLightweightSpawnRecipe(const AActor* Actor
 
 bool FMISModule::DeferRefundUpdate(UFGBuildGunStateDismantle* State, bool bNoBuildCost)
 {
-    if (bFlushingRefundUpdate || ActiveState.Get() != State || (!bDeferringRefundUpdates && !IsSelectionBusy())) return false;
+    if (bFlushingRefundUpdate || ActiveState.Get() != State) return false;
     bRefundUpdatePending = true;
     bRefundNoBuildCost = bNoBuildCost;
     return true;
@@ -1008,8 +1007,9 @@ void FMISModule::SetFarDistance(float Meters)
     if (IsApplying() || !FMath::IsFinite(Meters)) return;
     bDistanceWasEdited = true;
     const float Far = MIS::ClampSelectionDistanceMeters(Meters);
+    const float Previous = GetFarDistance();
     MaxDistance.AsVariable()->Set(Far, ECVF_SetByConsole);
-    QueuePreviewRefresh();
+    if (Far != Previous) QueuePreviewRefresh();
 }
 
 FText FMISModule::GetActivityStatus() const

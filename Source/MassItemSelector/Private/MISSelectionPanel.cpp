@@ -490,6 +490,11 @@ void FMISModule::ApplySelectionEdits()
 {
     if (!IsDefaultDismantleMode() || !bSelectionInteractive || IsSelectionBusy() || !HasSelectionEdits()) return;
     auto* State = ActiveState.Get();
+    int32 ExpectedOperations = 0;
+    for (const auto& Row : SelectionTypes)
+        if (Row->PendingEnabled.IsSet())
+            ExpectedOperations += Row->PendingEnabled.GetValue() ? Row->Excluded : Row->Selected;
+    SelectionOperations.Reserve(ExpectedOperations);
     NextSelectionOperation = SelectionOperationChanged = 0;
     for (AActor* Actor : State->mPendingDismantleActors)
     {

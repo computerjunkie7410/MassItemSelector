@@ -61,6 +61,7 @@ private:
     friend class FMISScanBudgetTest;
     friend class FMISCrashRegressionTest;
     friend class FMISSelectionApplyTest;
+    friend class FMISLowRiskPerformanceTest;
 #endif
     struct FCandidate
     {
@@ -143,7 +144,6 @@ private:
     int32 NextSelectionOperation = 0;
     int32 SelectionOperationChanged = 0;
     bool bInsideSelectionMutation = false;
-    bool bDeferringRefundUpdates = false;
     bool bFlushingRefundUpdate = false;
     bool bRefundUpdatePending = false;
     bool bRefundNoBuildCost = false;
