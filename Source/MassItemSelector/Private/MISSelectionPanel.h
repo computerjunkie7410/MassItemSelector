@@ -56,6 +56,9 @@ struct FMISSelectionType
 {
     TWeakObjectPtr<UClass> Class;
     FText Name;
+    TWeakObjectPtr<UClass> NameRecipe;
+    TWeakObjectPtr<UClass> NameDescriptor;
+    uint32 NameTextRevision = MAX_uint32;
     int32 Selected = 0;
     int32 Excluded = 0;
     FText Label;
@@ -74,6 +77,7 @@ public:
     void Construct(const FArguments& Args);
     void Refresh(bool bRowsChanged);
     void SetSide(bool bRight);
+    bool IsUnderPointer(const FPointerEvent& Event) const;
     virtual bool SupportsKeyboardFocus() const override { return true; }
     virtual FReply OnPreviewKeyDown(const FGeometry&, const FKeyEvent&) override;
     virtual FReply OnKeyDown(const FGeometry&, const FKeyEvent&) override;
@@ -83,6 +87,7 @@ private:
     TSharedRef<ITableRow> MakeRow(TSharedPtr<FMISSelectionType> Item, const TSharedRef<STableViewBase>& Table);
     FMISModule* Owner = nullptr;
     TSharedPtr<SListView<TSharedPtr<FMISSelectionType>>> List;
+    TSharedPtr<SWidget> Body;
     float PanelWidth = 320.f;
     FSlateFontInfo RowFont;
 };

@@ -2,8 +2,11 @@
 #include "MISModule.h"
 #include "MISConfiguration.h"
 #include "MISSelectionObserver.h"
+#include "MISSelectionNames.h"
 #include "MISBuildableEligibility.h"
 #include "FGRecipe.h"
+#include "FGCustomizationRecipe.h"
+#include "FGFactoryColoringTypes.h"
 #include "Buildables/FGBuildable.h"
 #include "Equipment/FGBuildGunDismantle.h"
 #include "FGLightweightBuildableSubsystem.h"
@@ -18,7 +21,6 @@
 #include "Internationalization/TextLocalizationManager.h"
 #include "Resources/FGItemDescriptor.h"
 #include "Styling/CoreStyle.h"
-#include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
@@ -26,6 +28,20 @@
 #include "Widgets/Text/STextBlock.h"
 
 #define LOCTEXT_NAMESPACE "ItemSelector"
+
+static FText GetSelectionTypeName(const AFGBuildable* Buildable)
+{
+    FText Name = UFGItemDescriptor::GetItemName(Buildable->GetBuiltWithDescriptor());
+    if (Name.IsEmpty()) Name = Buildable->mDisplayName;
+    if (Name.IsEmpty()) Name = FText::FromString(Buildable->GetClass()->GetName());
+
+    const auto Recipe = Buildable->GetBuiltWithRecipe();
+    const auto MaterialRecipe = Recipe ? UFGRecipe::GetMaterialCustomizationRecipe(Recipe) : nullptr;
+    const FText Material = MaterialRecipe
+        ? UFGItemDescriptor::GetItemName(UFGCustomizationRecipe::GetCustomizationDescriptor(MaterialRecipe))
+        : FText::GetEmpty();
+    return MISFormatSelectionTypeName(Name, Material);
+}
 
 void UMISSelectionObserver::SelectionChanged()
 {
@@ -41,7 +57,7 @@ void SMISSelectionPanel::Construct(const FArguments& Args)
         SNew(SVerticalBox)
         + SVerticalBox::Slot().AutoHeight()
         [
-            SNew(SBorder).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+            SAssignNew(Body, SBorder).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
             .BorderBackgroundColor(FLinearColor(0.02f, 0.02f, 0.02f, 0.92f)).Padding(12)
             [
                 SNew(SBox).WidthOverride_Lambda([this] { return PanelWidth; }).MaxDesiredHeight(520)
@@ -63,10 +79,6 @@ void SMISSelectionPanel::Construct(const FArguments& Args)
                     + SVerticalBox::Slot().AutoHeight().Padding(0, 6)
                     [ SNew(STextBlock).Text_Lambda([this] { return Owner->GetSelectionStatus(); }).AutoWrapText(true)
                         .Visibility_Lambda([this] { return Owner->GetSelectionStatus().IsEmpty() ? EVisibility::Collapsed : EVisibility::Visible; }) ]
-                    + SVerticalBox::Slot().AutoHeight()
-                    [ SNew(SButton).Text(LOCTEXT("SelectionDone", "Return to Dismantling"))
-                        .Visibility_Lambda([this] { return Owner->IsSelectionInteractive() ? EVisibility::Visible : EVisibility::Collapsed; })
-                        .OnClicked_Lambda([this] { Owner->CloseSelectionInteraction(); return FReply::Handled(); }) ]
                 ]
             ]
         ]
@@ -122,24 +134,33 @@ void SMISSelectionPanel::Refresh(bool bRowsChanged)
     if (bRowsChanged) List->RequestListRefresh();
 }
 
+bool SMISSelectionPanel::IsUnderPointer(const FPointerEvent& Event) const
+{
+    return Body->GetCachedGeometry().IsUnderLocation(Event.GetScreenSpacePosition());
+}
+
 void SMISSelectionPanel::SetSide(bool bRight)
 {
     ChildSlot.HAlign(bRight ? HAlign_Right : HAlign_Left).VAlign(VAlign_Center).Padding(20);
 }
 
-FReply SMISSelectionPanel::OnPreviewKeyDown(const FGeometry& Geometry, const FKeyEvent& Event)
+FReply SMISSelectionPanel::OnPreviewKeyDown(const FGeometry&, const FKeyEvent& Event)
 {
-    if (Event.GetKey() == EKeys::N || Event.GetKey() == EKeys::Escape) return OnKeyDown(Geometry, Event);
-    return FReply::Unhandled();
+    return Owner->HandleDismantleShortcut(Event) ? FReply::Handled() : FReply::Unhandled();
 }
 
 FReply SMISSelectionPanel::OnKeyDown(const FGeometry&, const FKeyEvent& Event)
 {
-    if (Event.GetKey() == EKeys::N || Event.GetKey() == EKeys::Escape) Owner->CloseSelectionInteraction();
+    if (Owner->GetInputBindings().HideHUD.Matches(Event.GetKey(), Event.GetModifierKeys())) return FReply::Unhandled();
+    Owner->HandleDismantleShortcut(Event);
     return FReply::Handled();
 }
 
-FReply SMISSelectionPanel::OnMouseButtonDown(const FGeometry&, const FPointerEvent&) { return FReply::Handled(); }
+FReply SMISSelectionPanel::OnMouseButtonDown(const FGeometry&, const FPointerEvent& Event)
+{
+    return Owner->GetInputBindings().HideHUD.Matches(Event.GetEffectingButton(), Event.GetModifierKeys())
+        ? FReply::Unhandled() : FReply::Handled();
+}
 FReply SMISSelectionPanel::OnMouseButtonUp(const FGeometry&, const FPointerEvent&) { return FReply::Handled(); }
 
 FMISSelectionObject FMISModule::CaptureSelectionObject(AActor* Actor) const
@@ -261,11 +282,20 @@ void FMISModule::TickSelectionPanel()
 {
     auto* PC = Player.Get();
     if (!PC || !FSlateApplication::IsInitialized()) return;
+    if (!IsDefaultDismantleMode())
+    {
+        CloseSelectionInteraction();
+        bSelectionRequested = false;
+        if (SelectionPanel.IsValid()) SelectionPanel->SetVisibility(EVisibility::Collapsed);
+        ReleaseTemporaryPins(false);
+        return;
+    }
     if (bSelectionInteractive && (!FSlateApplication::Get().IsActive() || PC->IsPaused())) CloseSelectionInteraction();
     if (!PC->IsPaused()) ProcessSelectionOperations();
     const double Now = FPlatformTime::Seconds();
     const bool bCheckDue = Now >= NextSelectionCheck;
-    if (bSelectionSnapshotDirty || bCheckDue)
+    const bool bRefreshPanel = !IsSelectionBusy() || bCheckDue;
+    if (bRefreshPanel && (bSelectionSnapshotDirty || bCheckDue))
     {
         bSelectionSnapshotDirty = false;
         CheckSelectionChanges();
@@ -274,7 +304,7 @@ void FMISModule::TickSelectionPanel()
         bSelectionDirty |= SelectionTextRevision != TextRevision;
         SelectionTextRevision = TextRevision;
     }
-    if (bSelectionDirty)
+    if (bRefreshPanel && bSelectionDirty)
     {
         bSelectionDirty = false;
         RefreshSelectionPanel();
@@ -298,9 +328,8 @@ void FMISModule::TickSelectionPanel()
 
 void FMISModule::RefreshSelectionPanel()
 {
-    auto* State = ActiveState.Get();
     auto* PC = Player.Get();
-    if (!State || !PC) return;
+    if (!ActiveState.IsValid() || !PC) return;
     for (auto It = ExcludedSelection.CreateIterator(); It; ++It)
         if (!IsSelectionObjectValid(It.Value())) It.RemoveCurrent();
     for (auto& Pair : SelectionTypeLookup)
@@ -330,8 +359,16 @@ void FMISModule::RefreshSelectionPanel()
         ++Row->Selected;
         if (Row->Selected != 1) continue;
         const auto* Buildable = CastChecked<AFGBuildable>(Actor);
-        const FText Name = UFGItemDescriptor::GetItemName(Buildable->GetBuiltWithDescriptor());
-        if (!Name.IsEmpty()) Row->Name = Name;
+        const auto Recipe = Buildable->GetBuiltWithRecipe();
+        const auto Descriptor = Buildable->GetBuiltWithDescriptor();
+        if (Row->NameRecipe.Get() != Recipe.Get() || Row->NameDescriptor.Get() != Descriptor.Get() ||
+            Row->NameTextRevision != SelectionTextRevision)
+        {
+            Row->Name = GetSelectionTypeName(Buildable);
+            Row->NameRecipe = Recipe.Get();
+            Row->NameDescriptor = Descriptor.Get();
+            Row->NameTextRevision = SelectionTextRevision;
+        }
     }
     for (const auto& Pair : ExcludedSelection) ++FindGroup(Pair.Value.Class.Get())->Excluded;
     UpdatedSelectionTypes.Reset(SelectionTypeLookup.Num());
@@ -371,22 +408,32 @@ void FMISModule::RefreshSelectionPanel()
     SelectionPanel->Refresh(bRowsChanged);
 }
 
+bool FMISModule::QueueSelectionInteraction(FKey Key, const FModifierKeysState& Modifiers, bool bRepeat)
+{
+    const auto* PC = Player.Get();
+    if (!IsDefaultDismantleMode() || !InputBindings.SelectionFilter.Matches(Key, Modifiers) || !SelectionPanel.IsValid() ||
+        Overlay.IsValid() || !PC || PC->IsPaused() || (!bSelectionInteractive && PC->bShowMouseCursor)) return false;
+    if (!bRepeat) bSelectionRequested = true;
+    return true;
+}
+
 void FMISModule::ToggleSelectionInteraction()
 {
     if (bSelectionInteractive) { CloseSelectionInteraction(); return; }
     auto* PC = Player.Get();
-    if (!PC || PC->IsPaused() || Overlay.IsValid() || IsApplying() || !SelectionPanel.IsValid() ||
+    if (!IsDefaultDismantleMode() || !PC || PC->IsPaused() || Overlay.IsValid() || IsApplying() || !SelectionPanel.IsValid() ||
         (GetPanelSelectedCount() <= 1 && ExcludedSelection.IsEmpty()) ||
-        PC->bShowMouseCursor || PC->IsInputKeyDown(EKeys::LeftMouseButton)) return;
+        PC->bShowMouseCursor || PC->IsInputKeyDown(InputBindings.Primary.Key)) return;
     bSelectionPreviousCursor = PC->bShowMouseCursor;
     bSelectionInteractive = true;
+    NextHintUpdate = 0;
     ActiveState->ResetBuildGunDelay();
     ActiveState->SetAimedAtActor(nullptr);
     PC->SetIgnoreLookInput(true);
     PC->SetIgnoreMoveInput(true);
     PC->bShowMouseCursor = true;
     SelectionPanel->SetVisibility(EVisibility::Visible);
-    FInputModeUIOnly Mode;
+    FInputModeGameAndUI Mode;
     Mode.SetWidgetToFocus(SelectionPanel);
     Mode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
     PC->SetInputMode(Mode);
@@ -403,6 +450,7 @@ void FMISModule::CloseSelectionInteraction()
         bSelectionDirty = true;
     }
     bSelectionInteractive = false;
+    NextHintUpdate = 0;
     if (auto* PC = Player.Get())
     {
         PC->SetIgnoreLookInput(false);
@@ -416,9 +464,8 @@ void FMISModule::CloseSelectionInteraction()
 
 void FMISModule::SetSelectionTypeEnabled(UClass* Class, bool bEnabled)
 {
+    if (!IsDefaultDismantleMode() || !Class || !bSelectionInteractive || IsSelectionBusy()) return;
     auto* State = ActiveState.Get();
-    if (!State || !Class || !bSelectionInteractive || IsSelectionBusy()) return;
-    SelectionOperations.Reset();
     bRestoreSelection = bEnabled;
     NextSelectionOperation = SelectionOperationChanged = 0;
     if (bEnabled)
@@ -436,8 +483,8 @@ void FMISModule::SetSelectionTypeEnabled(UClass* Class, bool bEnabled)
 
 void FMISModule::ProcessSelectionOperations()
 {
+    if (!IsDefaultDismantleMode() || SelectionOperations.IsEmpty()) return;
     auto* State = ActiveState.Get();
-    if (!State || SelectionOperations.IsEmpty()) return;
     const double Deadline = FPlatformTime::Seconds() + 0.002;
     const int32 Requested = SelectionOperations.Num();
     TGuardValue<bool> MutationGuard(bInsideSelectionMutation, true);

@@ -7,7 +7,7 @@ public class MassItemSelector : ModuleRules
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 		CppStandard = CppStandardVersion.Cpp20;
 
-		// FactoryGame transitive dependencies
+		// Includes transitive dependencies required by FactoryGame headers.
 		PublicDependencyModuleNames.AddRange(new string[] {
 			"Core", "CoreUObject",
 			"Engine",
@@ -27,18 +27,11 @@ public class MassItemSelector : ModuleRules
 			"EnhancedInput",
 			"NetCore",
 			"GameplayTags",
-			"Json", "JsonUtilities"
+			"Json", "JsonUtilities",
+			"DummyHeaders", "FactoryGame", "SML"
 		});
 
-		// Header stubs
-		PublicDependencyModuleNames.AddRange(new string[] {
-			"DummyHeaders",
-		});
-
-		if (Target.Type == TargetRules.TargetType.Editor) {
-			PublicDependencyModuleNames.AddRange(new string[] {"AnimGraph"});
-		}
-		PublicDependencyModuleNames.AddRange(new string[] {"FactoryGame", "SML"});
-
+		if (Target.Type == TargetRules.TargetType.Editor)
+			PublicDependencyModuleNames.Add("AnimGraph");
 	}
 }
