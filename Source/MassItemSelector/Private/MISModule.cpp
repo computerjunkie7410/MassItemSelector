@@ -137,12 +137,19 @@ void FMISModule::ShutdownModule()
 
 void FMISModule::TickState(UFGBuildGunStateDismantle* State)
 {
-    if (Feedback.IsValid() && FeedbackExpires > 0 && FPlatformTime::Seconds() >= FeedbackExpires) RemoveFeedback();
+    if (Feedback.IsValid() && FPlatformTime::Seconds() >= FeedbackExpires) RemoveFeedback();
     AFGBuildGun* Gun = State->GetBuildGun();
     AFGCharacterPlayer* Character = Gun ? Gun->GetInstigatorCharacter() : nullptr;
     APlayerController* PC = Character ? Cast<APlayerController>(Character->GetController()) : nullptr;
     if (!PC || !PC->IsLocalController() || !PC->GetLocalPlayer()) return;
-    ON_SCOPE_EXIT { FlushRefundUpdate(); };
+    ON_SCOPE_EXIT {
+        FlushRefundUpdate();
+        const int32 Count = IsDefaultDismantleMode() ? State->GetNumPendingDismantleActors(false) : 0;
+        const int32 Limit = State->GetMaxNumPendingDismantleActors();
+        const bool bNativeMultiSelect = State->IsMultiDismantleActive();
+        for (const auto& Pair : DismantleHintTargets)
+            UMISHUDHooks::UpdateDismantleCounter(Pair.Key.Get(), Count, Limit, bNativeMultiSelect);
+    };
     if (ActiveState.Get() != State)
     {
         if (ActiveState.IsValid()) EndState(ActiveState.Get());
@@ -615,7 +622,7 @@ void FMISModule::ApplyPreview()
     bPreviewReady = false;
     bApplying = bScanning = true;
     ReleaseOverlay();
-    ShowFeedback(FText::GetEmpty(), true);
+    RemoveFeedback();
 }
 
 bool FMISModule::HasObjectHeadroom() const
@@ -832,7 +839,7 @@ void FMISModule::FinishApply(const FText& Message)
     ShowFeedback(Result);
 }
 
-void FMISModule::ShowFeedback(const FText& Message, bool bProgress)
+void FMISModule::ShowFeedback(const FText& Message)
 {
     const auto* PC = Player.Get();
     UGameViewportClient* Viewport = PC && PC->GetWorld() ? PC->GetWorld()->GetGameViewport() : nullptr;
@@ -848,12 +855,10 @@ void FMISModule::ShowFeedback(const FText& Message, bool bProgress)
             .BorderBackgroundColor(FLinearColor(0.02f, 0.02f, 0.02f, 0.9f)).Padding(12)
             [ SNew(STextBlock).WrapTextAt(850).Justification(ETextJustify::Center)
                 .ColorAndOpacity(FLinearColor::White)
-                .Text_Lambda([this, FixedMessage = Message, bProgress] {
-                    return bProgress ? GetActivityStatus() : FixedMessage;
-                }) ]
+                .Text(Message) ]
         ];
     FeedbackViewport = Viewport;
-    FeedbackExpires = bProgress ? 0 : FPlatformTime::Seconds() + 6;
+    FeedbackExpires = FPlatformTime::Seconds() + 6;
     Viewport->AddViewportWidgetContent(Feedback.ToSharedRef(), 101);
 }
 
@@ -1010,13 +1015,6 @@ void FMISModule::SetFarDistance(float Meters)
     const float Previous = GetFarDistance();
     MaxDistance.AsVariable()->Set(Far, ECVF_SetByConsole);
     if (Far != Previous) QueuePreviewRefresh();
-}
-
-FText FMISModule::GetActivityStatus() const
-{
-    if (bGatheringCandidates) return LastResult;
-    return ActivityTextCache.Get(bScanning, bApplying, NextCandidate,
-        Candidates.Num(), PreviewCandidates.Num(), LastResult);
 }
 
 IMPLEMENT_MODULE(FMISModule, MassItemSelector)

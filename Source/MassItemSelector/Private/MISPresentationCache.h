@@ -63,34 +63,3 @@ private:
     bool bOutlineDirty = true;
     bool bCursorReady = false;
 };
-
-class FMISActivityTextCache
-{
-public:
-    FText Get(bool bScanning, bool bApplying, int32 Processed, int32 Total,
-        int32 Matches, const FText& Result)
-    {
-        if (!bScanning) return Result;
-        const bool bSameValues = CachedProcessed == Processed && CachedTotal == Total &&
-            (bApplying || CachedMatches == Matches);
-        if (bReady && bApplying == bCachedApplying && bSameValues) return Text;
-
-        Text = bApplying
-            ? FText::Format(NSLOCTEXT("ItemSelector", "ApplyingProgress", "Adding selection: {0}/{1} processed"), Processed, Total)
-            : FText::Format(NSLOCTEXT("ItemSelector", "PreviewProgress", "Previewing {0}/{1}; {2} in range (nothing added)"), Processed, Total, Matches);
-        bCachedApplying = bApplying;
-        CachedProcessed = Processed;
-        CachedTotal = Total;
-        CachedMatches = Matches;
-        bReady = true;
-        return Text;
-    }
-
-private:
-    bool bCachedApplying = false;
-    int32 CachedProcessed = 0;
-    int32 CachedTotal = 0;
-    int32 CachedMatches = 0;
-    FText Text;
-    bool bReady = false;
-};

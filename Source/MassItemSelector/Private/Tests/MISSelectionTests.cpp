@@ -3,6 +3,7 @@
 #include "MISSelectionPanel.h"
 #include "MISHUDHooks.h"
 #include "Blueprint/UserWidget.h"
+#include "Components/TextBlock.h"
 #include "UObject/StructOnScope.h"
 #include "Patching/BlueprintHookBlueprint.h"
 #include "Patching/BlueprintHookTargetSpecifiers.h"
@@ -94,6 +95,64 @@ bool FMISHintContentTest::RunTest(const FString&)
     BHints.SwapValues(0, 1);
     BHints.RemoveValues(1);
     TestFalse(TEXT("Removing a hint requires an update"), UMISHUDHooks::HaveSameHints(Array, A, B));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMISNativeCounterTest, "MassItemSelector.Selection.NativeCounter",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMISNativeCounterTest::RunTest(const FString&)
+{
+    UClass* Class = LoadClass<UUserWidget>(nullptr,
+        TEXT("/Game/FactoryGame/Interface/UI/InGame/Widget_DismantleMode.Widget_DismantleMode_C"));
+    if (!TestNotNull(TEXT("Native dismantle HUD class exists"), Class)) return false;
+    auto* PanelProperty = FindFProperty<FObjectPropertyBase>(Class, TEXT("mMassDismantleFeedback"));
+    auto* NumberProperty = FindFProperty<FObjectPropertyBase>(Class, TEXT("mDismantleNumberText"));
+    UFunction* Refresh = Class->FindFunctionByName(TEXT("UpdateMassDismantleFeedback"));
+    if (!TestNotNull(TEXT("Native counter panel property exists"), PanelProperty) ||
+        !TestNotNull(TEXT("Native counter text property exists"), NumberProperty) ||
+        !TestNotNull(TEXT("Native counter refresh function exists"), Refresh)) return false;
+    TestEqual(TEXT("Native counter refresh takes no parameters"), Refresh->NumParms, static_cast<uint8>(0));
+    if (!TestTrue(TEXT("Native panel is a widget"), PanelProperty->PropertyClass->IsChildOf(UWidget::StaticClass())) ||
+        !TestTrue(TEXT("Native number is a text block"), NumberProperty->PropertyClass->IsChildOf(UTextBlock::StaticClass()))) return false;
+    auto* Target = NewObject<UUserWidget>(GetTransientPackage(), Class);
+    auto* Panel = NewObject<UWidget>(Target, PanelProperty->PropertyClass);
+    auto* Number = NewObject<UTextBlock>(Target, NumberProperty->PropertyClass);
+    PanelProperty->SetObjectPropertyValue_InContainer(Target, Panel);
+    NumberProperty->SetObjectPropertyValue_InContainer(Target, Number);
+    const FText Original = FText::FromString(TEXT("Original native text"));
+    Panel->SetVisibility(ESlateVisibility::Collapsed);
+    Number->SetText(Original);
+    ON_SCOPE_EXIT {
+        UMISHUDHooks::UpdateDismantleCounter(Target, 0, 100000, false);
+        UMISHUDHooks::ClearNativeHintState();
+    };
+    UMISHUDHooks::UpdateDismantleCounter(Target, 4094, 100000, false);
+    TestEqual(TEXT("A selection reveals the native panel"), Panel->GetVisibility(), ESlateVisibility::HitTestInvisible);
+    TestTrue(TEXT("The native text shows selected count and limit"), Number->GetText().EqualTo(
+        FText::Format(FText::FromString(TEXT("{0} / {1}")), 4094, 100000)));
+    UMISHUDHooks::UpdateDismantleCounter(Target, 12, 50000, false);
+    TestTrue(TEXT("Removing selections and changing the limit updates the counter"), Number->GetText().EqualTo(
+        FText::Format(FText::FromString(TEXT("{0} / {1}")), 12, 50000)));
+    UMISHUDHooks::UpdateDismantleCounter(Target, 0, 50000, false);
+    TestEqual(TEXT("An empty selection restores native panel visibility"), Panel->GetVisibility(), ESlateVisibility::Collapsed);
+    TestTrue(TEXT("Releasing the counter restores unmodified native text"), Number->GetText().EqualTo(Original));
+    UMISHUDHooks::UpdateDismantleCounter(Target, 2, 100000, false);
+    UMISHUDHooks::UpdateDismantleCounter(Target, 2, 100000, true);
+    TestEqual(TEXT("Native multi-select retains control of its visible panel"), Panel->GetVisibility(), ESlateVisibility::HitTestInvisible);
+    Panel->SetVisibility(ESlateVisibility::Collapsed);
+    auto* BoundText = NewObject<UTextBlock>(Target);
+    BoundText->SetText(Original);
+    Number->TextDelegate.BindUFunction(BoundText, TEXT("GetText"));
+    UMISHUDHooks::UpdateDismantleCounter(Target, 3, 100000, false);
+    TestTrue(TEXT("Native text bindings remain intact"), Number->TextDelegate.IsBound());
+    Number->TextDelegate.Unbind();
+    const FText NewNativeText = FText::FromString(TEXT("New native text"));
+    Number->SetText(NewNativeText);
+    Panel->SetVisibility(ESlateVisibility::Hidden);
+    UMISHUDHooks::UpdateDismantleCounter(Target, 0, 100000, false);
+    TestTrue(TEXT("Cleanup preserves newer native text"), Number->GetText().EqualTo(NewNativeText));
+    TestEqual(TEXT("Cleanup preserves newer native visibility"), Panel->GetVisibility(), ESlateVisibility::Hidden);
     return true;
 }
 

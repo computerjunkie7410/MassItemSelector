@@ -3,7 +3,6 @@
 #include "CoreMinimal.h"
 #include "Modules/ModuleManager.h"
 #include "MISSelectionGeometry.h"
-#include "MISPresentationCache.h"
 #include "MISSelectionPanel.h"
 #include "MISBuildableEligibility.h"
 #include "UObject/StrongObjectPtr.h"
@@ -42,7 +41,6 @@ public:
     bool IsDistancePanelOnRight() const;
     bool IsApplying() const { return bScanning && bApplying; }
     bool IsScanning() const { return bScanning; }
-    FText GetActivityStatus() const;
     const TArray<TSharedPtr<FMISSelectionType>>& GetSelectionTypes() const { return SelectionTypes; }
     void SetSelectionTypeEnabled(UClass* Class, bool bEnabled);
     void ApplySelectionEdits();
@@ -104,7 +102,7 @@ private:
     bool HasObjectHeadroom() const;
     void FinishPreview();
     void FinishApply(const FText& Message);
-    void ShowFeedback(const FText& Message, bool bProgress = false);
+    void ShowFeedback(const FText& Message);
     void RemoveFeedback();
     void InstallDismantleInput();
     void RemoveDismantleInput();
@@ -218,7 +216,6 @@ private:
     float StrokeFarMeters = 100;
     bool bPreviousCursor = false;
     FText LastResult;
-    mutable FMISActivityTextCache ActivityTextCache;
     FDelegateHandle PrimaryFireHook;
     FDelegateHandle TickHook;
     FDelegateHandle EndHook;

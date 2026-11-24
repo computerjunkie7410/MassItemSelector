@@ -20,6 +20,7 @@ public:
     static bool ShouldRebuildNativeHints(UObject* Target, const TArray<int32>& Hints);
     DECLARE_FUNCTION(execShouldRebuildNativeHints);
     static void ClearNativeHintState();
+    static void UpdateDismantleCounter(UObject* Target, int32 Count, int32 Limit, bool bNativeMultiSelect);
     static bool HaveSameHints(FArrayProperty* Array, const void* A, const void* B);
     static void UpdateDismantleHints(UObject* Target, EMISDismantleHints Mode, TSharedPtr<FStructOnScope>& SavedHints, APlayerController* Player, const MIS::FDismantleBindings& Bindings);
 private:
