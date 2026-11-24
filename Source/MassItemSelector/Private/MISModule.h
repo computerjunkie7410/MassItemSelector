@@ -3,7 +3,6 @@
 #include "CoreMinimal.h"
 #include "Modules/ModuleManager.h"
 #include "MISSelectionGeometry.h"
-#include "MISPresentationCache.h"
 #include "MISSelectionPanel.h"
 #include "MISBuildableEligibility.h"
 #include "UObject/StrongObjectPtr.h"
@@ -21,6 +20,7 @@ class UEnhancedInputComponent;
 class UMISSelectionObserver;
 class FStructOnScope;
 class IInputProcessor;
+class UFGRecipe;
 
 class FMISModule : public IModuleInterface
 {
@@ -41,9 +41,10 @@ public:
     bool IsDistancePanelOnRight() const;
     bool IsApplying() const { return bScanning && bApplying; }
     bool IsScanning() const { return bScanning; }
-    FText GetActivityStatus() const;
     const TArray<TSharedPtr<FMISSelectionType>>& GetSelectionTypes() const { return SelectionTypes; }
     void SetSelectionTypeEnabled(UClass* Class, bool bEnabled);
+    void ApplySelectionEdits();
+    bool HasSelectionEdits() const;
     bool IsSelectionInteractive() const { return bSelectionInteractive; }
     bool IsSelectionBusy() const { return !SelectionOperations.IsEmpty() || IsApplying(); }
     FText GetSelectionStatus() const;
@@ -56,6 +57,9 @@ private:
     friend class FMISSelectionLookupTest;
     friend class FMISSelectionModeTest;
     friend class FMISScanBudgetTest;
+    friend class FMISCrashRegressionTest;
+    friend class FMISSelectionApplyTest;
+    friend class FMISLowRiskPerformanceTest;
 #endif
     struct FCandidate
     {
@@ -87,6 +91,10 @@ private:
     void RefreshSelectedActorLookup(const UFGBuildGunStateDismantle* State);
     void UpdateSelectedActorLookup(const UFGBuildGunStateDismantle* State, AActor* Actor, int32 PreviousCount);
     void AddActor(AFGBuildable* Actor);
+    AFGBuildable* ResolveLightweightBuildable(UClass* Class, int32 Index, const FTransform& Transform);
+    TSubclassOf<UFGRecipe> GetLightweightSpawnRecipe(const AActor* Actor) const;
+    bool DeferRefundUpdate(UFGBuildGunStateDismantle* State, bool bNoBuildCost);
+    void FlushRefundUpdate();
     bool ViewIsUnchanged() const;
     bool IsDefaultDismantleMode() const;
     void ReleaseTemporaryPins(bool bAll);
@@ -94,7 +102,7 @@ private:
     bool HasObjectHeadroom() const;
     void FinishPreview();
     void FinishApply(const FText& Message);
-    void ShowFeedback(const FText& Message, bool bProgress = false);
+    void ShowFeedback(const FText& Message);
     void RemoveFeedback();
     void InstallDismantleInput();
     void RemoveDismantleInput();
@@ -130,11 +138,17 @@ private:
     TArray<FMISSelectionSnapshotEntry> UpdatedSelectionSnapshot;
     MIS::FBuildableEligibilityCache BuildableEligibility;
     TMap<FMISSelectionKey, FMISSelectionObject> ExcludedSelection;
-    TArray<FMISSelectionObject> SelectionOperations;
+    TArray<FMISSelectionOperation> SelectionOperations;
     int32 NextSelectionOperation = 0;
     int32 SelectionOperationChanged = 0;
-    bool bRestoreSelection = false;
     bool bInsideSelectionMutation = false;
+    bool bFlushingRefundUpdate = false;
+    bool bRefundUpdatePending = false;
+    bool bRefundNoBuildCost = false;
+    double NextRefundUpdate = 0;
+    TSubclassOf<AFGBuildable> LightweightSpawnClass;
+    TSubclassOf<UFGRecipe> LightweightSpawnRecipe;
+    TWeakObjectPtr<UWorld> LightweightSpawnWorld;
     bool bSelectionDirty = true;
     bool bSelectionSnapshotDirty = true;
     bool bSelectedActorLookupDirty = true;
@@ -202,11 +216,13 @@ private:
     float StrokeFarMeters = 100;
     bool bPreviousCursor = false;
     FText LastResult;
-    mutable FMISActivityTextCache ActivityTextCache;
     FDelegateHandle PrimaryFireHook;
     FDelegateHandle TickHook;
     FDelegateHandle EndHook;
     FDelegateHandle AimHook;
     FDelegateHandle ClearHook;
+    FDelegateHandle RecipeFixupHook;
+    FDelegateHandle LightweightSpawnHook;
+    FDelegateHandle RefundHook;
     FDelegateHandle WorldCleanupHook;
 };

@@ -3,6 +3,8 @@
 #include "UObject/UnrealType.h"
 #include "UObject/StructOnScope.h"
 #include "Blueprint/UserWidget.h"
+#include "Components/TextBlock.h"
+#include "Engine/World.h"
 #include "UObject/Stack.h"
 
 #define LOCTEXT_NAMESPACE "ItemSelector"
@@ -18,6 +20,28 @@ struct FNativeHintState
     TUniquePtr<FStructOnScope> RenderedInput;
 };
 TMap<TWeakObjectPtr<UObject>, FNativeHintState> NativeHintStates;
+
+struct FNativeCounterState
+{
+    TWeakObjectPtr<UWidget> Panel;
+    TWeakObjectPtr<UTextBlock> Number;
+    ESlateVisibility Visibility = ESlateVisibility::Collapsed;
+    FText OriginalText;
+    FText Text;
+    int32 Count = INDEX_NONE;
+    int32 Limit = INDEX_NONE;
+
+    void Restore(UObject* Target, bool bNativeMultiSelect = false)
+    {
+        if (auto* Widget = Panel.Get())
+            if (!bNativeMultiSelect && Widget->GetVisibility() == ESlateVisibility::HitTestInvisible) Widget->SetVisibility(Visibility);
+        if (auto* Widget = Number.Get())
+            if (!Widget->TextDelegate.IsBound() && Widget->GetText().EqualTo(Text)) Widget->SetText(OriginalText);
+        UFunction* Refresh = Target->FindFunction(TEXT("UpdateMassDismantleFeedback"));
+        if (Refresh && Refresh->NumParms == 0) Target->ProcessEvent(Refresh, nullptr);
+    }
+};
+TMap<TWeakObjectPtr<UObject>, FNativeCounterState> NativeCounterStates;
 
 bool FindHintFields(FArrayProperty* Array, FTextProperty*& Action, FTextProperty*& Key)
 {
@@ -113,6 +137,48 @@ DEFINE_FUNCTION(UMISHUDHooks::execShouldRebuildNativeHints)
 void UMISHUDHooks::ClearNativeHintState()
 {
     NativeHintStates.Reset();
+    for (auto& Pair : NativeCounterStates)
+        if (auto* Target = Pair.Key.Get())
+            if (Target->GetWorld() && !Target->GetWorld()->bIsTearingDown) Pair.Value.Restore(Target);
+    NativeCounterStates.Reset();
+}
+
+void UMISHUDHooks::UpdateDismantleCounter(UObject* Target, int32 Count, int32 Limit, bool bNativeMultiSelect)
+{
+    if (!Target) return;
+    if (Count <= 0 || bNativeMultiSelect)
+    {
+        if (auto* Counter = NativeCounterStates.Find(Target))
+        {
+            Counter->Restore(Target, bNativeMultiSelect);
+            NativeCounterStates.Remove(Target);
+        }
+        return;
+    }
+    auto* Counter = NativeCounterStates.Find(Target);
+    if (!Counter)
+    {
+        auto* PanelProperty = FindFProperty<FObjectPropertyBase>(Target->GetClass(), TEXT("mMassDismantleFeedback"));
+        auto* NumberProperty = FindFProperty<FObjectPropertyBase>(Target->GetClass(), TEXT("mDismantleNumberText"));
+        auto* Panel = PanelProperty ? Cast<UWidget>(PanelProperty->GetObjectPropertyValue_InContainer(Target)) : nullptr;
+        auto* Number = NumberProperty ? Cast<UTextBlock>(NumberProperty->GetObjectPropertyValue_InContainer(Target)) : nullptr;
+        if (!Panel || !Number) return;
+        Counter = &NativeCounterStates.Add(Target);
+        Counter->Panel = Panel;
+        Counter->Number = Number;
+        Counter->Visibility = Panel->GetVisibility();
+        Counter->OriginalText = Number->GetText();
+    }
+    if (Counter->Count != Count || Counter->Limit != Limit)
+    {
+        Counter->Count = Count;
+        Counter->Limit = Limit;
+        Counter->Text = FText::Format(NSLOCTEXT("ItemSelector", "SelectionCount", "{0} / {1}"), Count, Limit);
+    }
+    if (auto* Number = Counter->Number.Get())
+        if (!Number->TextDelegate.IsBound() && !Number->GetText().EqualTo(Counter->Text)) Number->SetText(Counter->Text);
+    if (auto* Panel = Counter->Panel.Get())
+        if (Panel->GetVisibility() != ESlateVisibility::HitTestInvisible) Panel->SetVisibility(ESlateVisibility::HitTestInvisible);
 }
 
 bool UMISHUDHooks::HaveSameHints(FArrayProperty* Array, const void* A, const void* B)

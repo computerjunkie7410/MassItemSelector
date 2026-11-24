@@ -14,7 +14,7 @@ Quickly and easily select a large number of items at once. Especially helpful fo
 4. While holding the lasso key, hold the left mouse button and drag around the buildings you want to select. Release the mouse button or lasso key to finish the outline and preview the results.
 5. Adjust the distance setting using your mouse wheel. The distance controls appear in the upper-left corner of your screen by default; their position is configurable in Mod Options.
 6. Left-click once to add matching buildings to the dismantle selection, subject to the current filter and selection limit.
-7. With at least two buildings selected in Default dismantle mode, press `N` (or your configured key) to open the Advanced Dismantle Filter panel and filter the selected buildings (see version 1.1.0 notes below).
+7. With at least two buildings selected in Default dismantle mode, press `N` (or your configured key) to open the Advanced Dismantle Filter panel. Choose the building types to keep, then click **Apply**. Closing the panel before applying discards pending edits; closing it after applying lets the update finish in the background.
 
 The number of buildings you can select depends on the dismantle limit. Pair this mod with Infinite Dismantle to select larger groups of buildings; the 500-meter range, building eligibility, and native filters still apply. Pair it with Quick Blueprint to quickly make or edit blueprints.
 
@@ -53,7 +53,7 @@ Upgrade minimum game build to 520140
 
 ## Version 1.1.0
 
-Added **Advanced Dismantle Filter**. Select two or more buildings and press `N` to see them grouped by type, with a count for each. Uncheck a type to leave those buildings out, or recheck it to bring them back. Works with both the lasso and normal dismantle selections.
+Added **Advanced Dismantle Filter**. Select two or more buildings and press `N` to see them grouped by type, with a count for each. Uncheck a type to leave those buildings out, or recheck it to bring them back, then click **Apply**. Works with both the lasso and normal dismantle selections.
 
 The panel appears on the left by default and can be moved to the right in Mod Options.
 
