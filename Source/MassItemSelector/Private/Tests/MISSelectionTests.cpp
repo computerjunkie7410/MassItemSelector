@@ -18,6 +18,7 @@
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "FGGameFeatureData.h"
+#include "MISGameFeatureData.h"
 #include "Engine/AssetManagerTypes.h"
 #include "Engine/AssetManager.h"
 #include "Configuration/Properties/ConfigPropertySection.h"
@@ -434,6 +435,9 @@ bool FMISLassoBindingsTest::RunTest(const FString&)
     TestEqual(TEXT("The context follows native dismantling"), Context->mParentContext.ToSoftObjectPath().GetAssetName(), FString(TEXT("MC_BuildGunDismantle")));
     auto* Feature = LoadObject<UFGGameFeatureData>(nullptr, TEXT("/MassItemSelector/MassItemSelector.MassItemSelector"));
     if (!TestNotNull(TEXT("Game Feature data is packaged"), Feature)) return false;
+    TestTrue(TEXT("The saved feature uses MIS's primary asset identity implementation"), Feature->IsA<UMISGameFeatureData>());
+    TestTrue(TEXT("The root module registers MIS configuration"),
+        GetDefault<UMISGameInstanceModule>()->ModConfigurations.Contains(UMISModConfiguration::StaticClass()));
     TestEqual(TEXT("MIS uses the primary asset type registered by Unreal Game Features"),
         Feature->GetPrimaryAssetId(), FPrimaryAssetId(TEXT("GameFeatureData"), Feature->GetFName()));
     TestFalse(TEXT("The native class default object is not an asset"),
